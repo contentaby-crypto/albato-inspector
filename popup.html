@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Albato Inspector</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Albato Inspector</h1>
+        <p>Только чтение · MVP</p>
+      </div>
+      <span id="badge" class="badge">готов</span>
+    </header>
+
+    <section class="notice">
+      Откройте нужную связку в Albato. «Прочитать сценарий» покажет модули, а кнопка на модуле позволит отдельно снять его настройки. Read-only: сохранения и тесты не выполняются.
+    </section>
+
+    <button id="capture" class="primary">Прочитать сценарий</button>
+    <button id="full-audit" class="full-audit">Запустить полный аудит</button>
+
+    <label class="option test-option">
+      <input id="run-tests" type="checkbox">
+      <span>Запускать тест выбранного модуля (может обратиться к внешнему сервису)</span>
+    </label>
+    <label class="option">
+      <input id="include-journal" type="checkbox">
+      <span>Проверять журнал запусков</span>
+    </label>
+
+    <div id="status" class="status" role="status">Откройте нужный экран Albato и нажмите кнопку.</div>
+    <div id="summary" class="summary hidden"></div>
+    <div id="module-list" class="module-list hidden"></div>
+
+    <div class="actions">
+      <button id="copy" disabled>Скопировать JSON</button>
+      <button id="download" disabled>Скачать JSON</button>
+    </div>
+
+    <details>
+      <summary>Предпросмотр данных</summary>
+      <pre id="preview">Данные появятся после захвата.</pre>
+    </details>
+
+    <footer>Версия 0.4.19 · albato-audit/v2</footer>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

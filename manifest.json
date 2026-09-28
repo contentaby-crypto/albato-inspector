@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Albato Inspector MVP",
+  "version": "0.4.19",
+  "description": "Read-only capture of the visible Albato page for audit by an AI agent.",
+  "action": {
+    "default_title": "Albato Inspector",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "assets/icon16.png",
+      "32": "assets/icon32.png",
+      "48": "assets/icon48.png",
+      "128": "assets/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "assets/icon16.png",
+    "32": "assets/icon32.png",
+    "48": "assets/icon48.png",
+    "128": "assets/icon128.png"
+  },
+  "permissions": ["activeTab", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": [
+    "https://albato.com/*",
+    "https://*.albato.com/*",
+    "https://albato.ru/*",
+    "https://*.albato.ru/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://albato.com/*",
+        "https://*.albato.com/*",
+        "https://albato.ru/*",
+        "https://*.albato.ru/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,1134 @@
+(() => {
+  'use strict';
+
+  const MAX_TEXT = 260;
+  const MAX_ITEMS = 80;
+  const MAX_TABLE_ROWS = 60;
+  const MAX_VISIBLE_TEXT = 12000;
+  const SENSITIVE_NAME = /(pass(word)?|secret|token|api[-_ ]?key|access[-_ ]?key|refresh[-_ ]?token|cookie|session|authorization|bearer)/i;
+  const ERROR_NAME = /(error|fail|ошиб|warning|warn|предупреж|reset progress|сбросить прогресс)/i;
+
+  function normalizeText(value, max = MAX_TEXT) {
+    return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+  }
+
+  function redact(value, hint = '', max = 1000) {
+    const text = normalizeText(value, max);
+    if (!text) return '';
+    if (SENSITIVE_NAME.test(hint)) return '[masked]';
+    return text
+      .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [masked]')
+      .replace(/([?&](?:token|key|secret|password|auth|signature)=)[^&\s]+/gi, '$1[masked]')
+      .replace(/\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}\b/g, '[jwt-masked]')
+      .slice(0, max);
+  }
+
+  function isVisible(element) {
+    if (!(element instanceof Element)) return false;
+    if (element.hidden || element.getAttribute('aria-hidden') === 'true') return false;
+    const style = getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function elementLabel(element) {
+    const aria = element.getAttribute('aria-label');
+    if (aria) return redact(aria, 'label');
+    const title = element.getAttribute('title');
+    if (title) return redact(title, 'label');
+    const id = element.getAttribute('id');
+    if (id) {
+      const label = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+      if (label) return redact(label.textContent, 'label');
+    }
+    const parentLabel = element.closest('label');
+    if (parentLabel) return redact(parentLabel.textContent, 'label');
+    const preceding = element.previousElementSibling;
+    if (preceding && ['LABEL', 'SPAN', 'DIV'].includes(preceding.tagName)) {
+      const text = normalizeText(preceding.textContent, 180);
+      if (text) return redact(text, 'label');
+    }
+    return '';
+  }
+
+  function controlValue(element) {
+    const hint = [element.name, element.id, element.getAttribute('autocomplete'), element.getAttribute('placeholder')].filter(Boolean).join(' ');
+    if (element.type === 'password' || SENSITIVE_NAME.test(hint)) return '[masked]';
+    if (element.tagName === 'SELECT') {
+      return Array.from(element.selectedOptions || []).map(option => redact(option.textContent, hint)).filter(Boolean).join(', ');
+    }
+    return redact(element.value, hint);
+  }
+
+  function pageIdentity() {
+    const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'))
+      .filter(isVisible)
+      .map(node => redact(node.textContent, 'heading'))
+      .filter(Boolean);
+    const title = redact(document.title, 'title');
+    const path = `${location.pathname}${location.hash || ''}`.slice(0, 500);
+    const name = headings[0] || title || 'Albato page';
+    return {
+      name,
+      title,
+      url: `${location.origin}${path}`,
+      route: location.pathname,
+      headings: headings.slice(0, 12)
+    };
+  }
+
+  function collectControls() {
+    const selector = 'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"], [role="listbox"], [role="checkbox"], [role="switch"]';
+    return Array.from(new Set(Array.from(document.querySelectorAll(selector))))
+      .filter(isVisible)
+      .slice(0, MAX_ITEMS)
+      .map((element, index) => {
+        const label = elementLabel(element);
+        const hint = [element.name, element.id, element.getAttribute('autocomplete'), element.getAttribute('placeholder'), label].filter(Boolean).join(' ');
+        const isNativeInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName);
+        const value = isNativeInput && !element.isContentEditable
+          ? controlValue(element)
+          : redact(element.getAttribute('aria-valuetext') || element.getAttribute('data-value') || element.textContent || '', hint, 500);
+        return {
+          index: index + 1,
+          tag: element.tagName.toLowerCase(),
+          role: element.getAttribute('role') || undefined,
+          type: element.getAttribute('type') || undefined,
+          label,
+          name: redact(element.getAttribute('name') || '', 'attribute'),
+          id: redact(element.getAttribute('id') || '', 'attribute'),
+          placeholder: redact(element.getAttribute('placeholder') || '', 'placeholder'),
+          value,
+          aria_value: redact(element.getAttribute('aria-valuetext') || '', hint, 500),
+          required: element.hasAttribute('required') || element.getAttribute('aria-required') === 'true',
+          disabled: element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true'
+        };
+      });
+  }
+
+  function collectButtons() {
+    return Array.from(document.querySelectorAll('button, [role="button"], a'))
+      .filter(isVisible)
+      .map(element => ({
+        role: element.tagName.toLowerCase() === 'a' ? 'link' : 'button',
+        text: redact(element.textContent, 'button'),
+        label: elementLabel(element),
+        disabled: element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true',
+        href: element.tagName.toLowerCase() === 'a' ? redact(element.getAttribute('href') || '', 'href') : undefined
+      }))
+      .filter(item => item.text || item.label)
+      .slice(0, MAX_ITEMS);
+  }
+
+  function collectHeadings() {
+    return Array.from(document.querySelectorAll('h1, h2, h3, h4, [role="heading"]'))
+      .filter(isVisible)
+      .map(element => ({
+        level: element.getAttribute('aria-level') || element.tagName.toLowerCase(),
+        text: redact(element.textContent, 'heading')
+      }))
+      .filter(item => item.text)
+      .slice(0, MAX_ITEMS);
+  }
+
+  function collectMessages() {
+    const selector = '[role="alert"], [role="status"], [aria-live="assertive"], [data-testid*="error"], [data-testid*="warning"], [class*="error"], [class*="warning"]';
+    const candidates = Array.from(document.querySelectorAll(selector))
+      .filter(isVisible)
+      .filter(element => !['BUTTON', 'A'].includes(element.tagName))
+      .map(element => redact(element.textContent, 'message', 700))
+      .filter(text => text && ERROR_NAME.test(text));
+    return [...new Set(candidates)].slice(0, MAX_ITEMS);
+  }
+
+  function collectVisibleText() {
+    const candidates = [document.body, ...Array.from(document.querySelectorAll('main, [role="main"], #app, [id*="app"], [class*="app"]'))]
+      .filter(isVisible)
+      .map(element => normalizeText(element.innerText || element.textContent || '', MAX_VISIBLE_TEXT))
+      .filter(Boolean)
+      .sort((left, right) => right.length - left.length);
+    return candidates.length ? redact(candidates[0], 'page-text', MAX_VISIBLE_TEXT) : '';
+  }
+
+  function collectStepHints(headings, buttons, text) {
+    const source = [...headings.map(item => item.text), ...buttons.map(item => item.text), text];
+    const hints = source.join(' | ').split('|').map(value => normalizeText(value, 180)).filter(Boolean);
+    const keywords = /(webhook|trigger|action|module|step|filter|condition|crm|telegram|google|http|api|триггер|действие|модуль|шаг|фильтр|условие)/i;
+    return [...new Set(hints.filter(value => keywords.test(value)))].slice(0, 30);
+  }
+
+  function collectDialogs() {
+    const detailSelector = '[role="dialog"], [aria-modal="true"], dialog, [class*="drawer"], [class*="modal"], [class*="popover"]';
+    const seen = new Set();
+    const result = [];
+    for (const dialog of Array.from(document.querySelectorAll(detailSelector)).filter(isVisible)) {
+      const text = redact(dialog.innerText || dialog.textContent || '', 'dialog', 6000);
+      const controls = Array.from(dialog.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"], [role="listbox"], [role="checkbox"], [role="switch"]'))
+        .filter(isVisible)
+        .map(element => ({
+          label: elementLabel(element),
+          role: element.getAttribute('role') || element.tagName.toLowerCase(),
+          value: redact(element.value || element.getAttribute('aria-valuetext') || element.getAttribute('data-value') || element.textContent || '', elementLabel(element), 700)
+        }))
+        .slice(0, MAX_ITEMS);
+      if (!text && !controls.length) continue;
+      const key = `${text}|${JSON.stringify(controls)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push({ index: result.length + 1, text, controls });
+      if (result.length >= 20) break;
+    }
+    return result;
+  }
+
+  function collectStepElements() {
+    return Array.from(document.querySelectorAll('button, [role="button"]'))
+      .filter(isVisible)
+      .filter(element => /^\d+\.\s*/.test(normalizeText(element.innerText || element.textContent, 1200)))
+      .filter(element => !isDangerousAction(element));
+  }
+
+  function isDangerousAction(element) {
+    const text = normalizeText(`${element.innerText || element.textContent || ''} ${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`, 1200);
+    return /(save|saved|unsaved|reset progress|publish|apply|delete|remove|run|test|сохран|сбросить|применить|удалить|запустить|протестировать)/i.test(text);
+  }
+
+  function stepElementData(element) {
+    const raw = normalizeText(element.innerText || element.textContent || '', 1200);
+    const header = raw.split(/Connection to/i)[0].trim();
+    const match = header.match(/^(\d+)\.\s*([^:]+):\s*(.*)$/);
+    return {
+      number: match ? Number(match[1]) : null,
+      app: match ? normalizeText(match[2], 120) : null,
+      operation: match ? normalizeText(match[3], 500) : header,
+      raw
+    };
+  }
+
+  function findStepElement(number, rawPrefix = '') {
+    const candidates = collectStepElements();
+    return candidates.find(element => {
+      const data = stepElementData(element);
+      return data.number === number && (!rawPrefix || data.raw.startsWith(rawPrefix.slice(0, 80)));
+    }) || candidates.find(element => stepElementData(element).number === number) || null;
+  }
+
+  function findModuleTitleElement(stepElement, plannedStep = null) {
+    const cardRect = stepElement.getBoundingClientRect();
+    const scope = stepElement.parentElement || document.body;
+    const titlePattern = /(?:\bGS|\bEmail|\bПауза|\bФильтр)\s*\d+\s*[—–-]/i;
+    const plannedMarker = String(plannedStep?.raw || '').match(titlePattern)?.[0] || '';
+    const candidates = [stepElement, ...Array.from(scope.querySelectorAll('*'))]
+      .filter(element => element !== stepElement && isVisible(element))
+      .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 320), rect: element.getBoundingClientRect() }))
+      .filter(item => item.text && item.text.length <= 260 && titlePattern.test(item.text))
+      .filter(item => item.rect.left >= cardRect.left - 8 && item.rect.right <= cardRect.right + 8 && item.rect.top >= cardRect.top - 8 && item.rect.top <= cardRect.top + cardRect.height * 0.72)
+      .sort((left, right) => left.text.length - right.text.length);
+    if (candidates[0]) return candidates[0].element;
+
+    if (plannedMarker) {
+      const pageCandidates = Array.from(document.querySelectorAll('*'))
+        .filter(element => element !== stepElement && isVisible(element))
+        .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 320), rect: element.getBoundingClientRect() }))
+        .filter(item => item.text.toLowerCase().includes(plannedMarker.toLowerCase()))
+        .filter(item => item.text.length <= 320 && item.rect.left >= cardRect.left - 12 && item.rect.right <= cardRect.right + 12 && item.rect.top >= cardRect.top - 12 && item.rect.top <= cardRect.top + cardRect.height * 0.72)
+        .sort((left, right) => left.text.length - right.text.length);
+      if (pageCandidates[0]) return pageCandidates[0].element;
+    }
+
+    if (plannedMarker) {
+      const pageWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let pageNode = pageWalker.nextNode();
+      while (pageNode) {
+        const raw = String(pageNode.nodeValue || '');
+        const markerIndex = raw.toLowerCase().indexOf(plannedMarker.toLowerCase());
+        if (markerIndex >= 0 && isVisible(pageNode.parentElement)) {
+          const range = document.createRange();
+          range.setStart(pageNode, markerIndex);
+          range.setEnd(pageNode, Math.min(raw.length, markerIndex + 140));
+          const rect = range.getBoundingClientRect();
+          if (rect.width > 0 && rect.left >= cardRect.left - 12 && rect.right <= cardRect.right + 12 && rect.top >= cardRect.top - 12 && rect.top <= cardRect.top + cardRect.height * 0.72) {
+            stepElement.__albatoClickRect = rect;
+            stepElement.__albatoClickText = plannedMarker;
+            return stepElement;
+          }
+        }
+        pageNode = pageWalker.nextNode();
+      }
+    }
+
+    // Some React Flow nodes expose the title as a text node inside the outer node.
+    // Keep the outer node as the event target, but place the synthetic click on the title range.
+    const walker = document.createTreeWalker(stepElement, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {
+      const raw = String(node.nodeValue || '');
+      const match = raw.match(titlePattern);
+      if (match && match.index !== undefined) {
+        const range = document.createRange();
+        range.setStart(node, match.index);
+        range.setEnd(node, Math.min(raw.length, match.index + 140));
+        const rect = range.getBoundingClientRect();
+        if (rect.width > 0 && rect.top >= cardRect.top - 8 && rect.top <= cardRect.top + cardRect.height * 0.72) {
+          stepElement.__albatoClickRect = rect;
+          stepElement.__albatoClickText = normalizeText(raw, 240);
+          return stepElement;
+        }
+      }
+      node = walker.nextNode();
+    }
+    // Final fallback for React Flow nodes without a separate title element.
+    // The safe target is the upper-middle title band, away from the three-dot menu and connection selector.
+    stepElement.__albatoClickBand = { left: 0.68, top: 0.28, width: 0.16, height: 0.18 };
+    delete stepElement.__albatoClickRect;
+    stepElement.__albatoClickText = 'module-title-band-fallback';
+    return stepElement;
+  }
+
+  function elementDescriptor(element) {
+    if (!element) return null;
+    return {
+      tag: element.tagName?.toLowerCase() || null,
+      role: element.getAttribute?.('role') || null,
+      text: element.__albatoClickText || normalizeText(element.innerText || element.textContent || '', 240),
+      class_name: normalizeText(typeof element.className === 'string' ? element.className : '', 240),
+      hit_target: element.__albatoHitTarget && element.__albatoHitTarget !== element ? {
+        tag: element.__albatoHitTarget.tagName?.toLowerCase() || null,
+        text: normalizeText(element.__albatoHitTarget.innerText || element.__albatoHitTarget.textContent || '', 180),
+        class_name: normalizeText(typeof element.__albatoHitTarget.className === 'string' ? element.__albatoHitTarget.className : '', 180)
+      } : null
+    };
+  }
+
+  function findStepMenuElement(stepElement) {
+    const cardRect = stepElement.getBoundingClientRect();
+    const scope = stepElement.closest('[data-node-id], [class*="node"], [class*="step"]') || stepElement.parentElement || document.body;
+    const candidates = Array.from(scope.querySelectorAll('button, [role="button"]'))
+      .filter(isVisible)
+      .filter(element => element !== stepElement)
+      .filter(element => {
+        const text = normalizeText(`${element.innerText || element.textContent || ''} ${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`, 160);
+        const rect = element.getBoundingClientRect();
+        const insideCard = rect.left >= cardRect.left - 12 && rect.right <= cardRect.right + 12 && rect.top >= cardRect.top - 12 && rect.bottom <= cardRect.bottom + 90;
+        return insideCard && (!text || /[⋮…]/.test(text) || element.getAttribute('aria-haspopup') === 'menu' || /menu|options|more|меню|действия/i.test(text));
+      });
+    return candidates[candidates.length - 1] || null;
+  }
+
+  function findSafeEditMenuItem() {
+    const scopes = Array.from(document.querySelectorAll('[role="menu"], [role="listbox"], [class*="menu"], [class*="popover"]')).filter(isVisible);
+    for (const scope of scopes) {
+      const candidates = Array.from(scope.querySelectorAll('[role="menuitem"], [role="option"], button, [role="button"], a'))
+        .filter(isVisible)
+        .filter(element => !isDangerousAction(element));
+      const edit = candidates.find(element => /(edit|configure|settings|настроить|изменить|редактировать|параметры)/i.test(normalizeText(element.innerText || element.textContent || '', 300)));
+      if (edit) return edit;
+    }
+    return null;
+  }
+
+  function activateDoubleClick(element) {
+    try { element.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window })); } catch (_) { /* optional */ }
+    try { element.dblclick(); } catch (_) { /* optional */ }
+  }
+
+  function moduleEvidence(baseline, snapshot, stateChanged, expectedStep = null) {
+    const beforeText = baseline?.evidence?.visible_text || '';
+    const afterText = snapshot?.evidence?.visible_text || '';
+    const detailControls = (snapshot?.evidence?.controls || []).filter(control => control.placeholder !== 'Опишите связку...');
+    const textChanged = beforeText !== afterText && Math.abs(afterText.length - beforeText.length) >= 180;
+    const signals = {
+      state_changed: Boolean(stateChanged),
+      text_changed: textChanged,
+      dialogs: (snapshot?.ui?.dialogs || 0) > 0,
+      extra_controls: detailControls.length > 0,
+      extra_tables: (snapshot?.ui?.tables || 0) > 0
+    };
+    const opened = signals.dialogs || signals.extra_controls || signals.extra_tables || signals.text_changed;
+    const dialogText = (snapshot?.evidence?.dialogs || []).map(dialog => dialog.text || '').join(' | ');
+    const connectionOnly = Boolean(dialogText) && /дополнительные параметры подключения|connection to google sheets/i.test(dialogText) && !/(фильтр|миграц|столбец|email|номер строки|строк[ау]|smtp|письм|услови)/i.test(dialogText);
+    const operation = String(expectedStep?.operation || '').toLowerCase();
+    const expectedMarkers = operation.includes('создана новая строка') ? ['создана новая строка', 'новая строка']
+      : operation.includes('задержка') || operation.includes('пауза') ? ['задержка', 'пауза']
+      : operation.includes('найти одну строку') ? ['найти одну строку']
+      : operation.includes('фильтр') || operation.includes('условию') ? ['задать поведение связки', 'условие']
+      : operation.includes('отправка письма') || operation.includes('smtp') ? ['отправка письма', 'smtp', 'электронная почта']
+      : operation.includes('обновить строку') || operation.includes('дата отправки') ? ['обновить строку', 'дата отправки']
+      : [];
+    const stepMatch = !expectedStep || !dialogText || expectedMarkers.length === 0 || expectedMarkers.some(marker => dialogText.toLowerCase().includes(marker));
+    signals.step_match = stepMatch;
+    const detailKind = !stepMatch ? 'stale-module-dialog' : (connectionOnly ? 'connection-settings' : (signals.dialogs ? 'module-settings-or-dialog' : (signals.extra_controls || signals.extra_tables || signals.text_changed ? 'module-content' : 'none')));
+    const moduleSettingsOpened = opened && stepMatch && !connectionOnly;
+    return {
+      opened,
+      module_settings_opened: moduleSettingsOpened,
+      detail_kind: detailKind,
+      signals,
+      reason: moduleSettingsOpened
+        ? 'Открыты детали модуля.'
+        : (!stepMatch ? 'Открытая панель относится к другому шагу; настройки текущего шага не подтверждены.' : (connectionOnly ? 'Открыты только дополнительные параметры подключения, не настройки операции.' : 'Изменения карточки не дали доступных деталей модуля.'))
+    };
+  }
+
+  function findSafeCloseElement() {
+    const scopes = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog, [class*="drawer"], [class*="modal"], [class*="popover"]')).filter(isVisible);
+    for (const scope of scopes) {
+      const candidates = Array.from(scope.querySelectorAll('button, [role="button"], [aria-label], [title]'))
+        .filter(isVisible)
+        .filter(element => !isDangerousAction(element));
+      const close = candidates.find(element => /(close|закрыть|back|назад|cancel|отменить|×)/i.test(`${element.innerText || ''} ${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`));
+      if (close) return close;
+    }
+    return null;
+  }
+
+  async function closeAllSafePanels() {
+    let previous = pageFingerprint();
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const close = findSafeCloseElement();
+      if (!close) {
+        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true })); } catch (_) { /* optional */ }
+        await delay(220);
+        const afterEscape = pageFingerprint();
+        if (afterEscape === previous) break;
+        previous = afterEscape;
+        continue;
+      }
+      activateElement(close);
+      await delay(280);
+      let next = pageFingerprint();
+      if (next === previous) {
+        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true })); } catch (_) { /* optional */ }
+        await delay(220);
+        next = pageFingerprint();
+      }
+      if (next === previous) break;
+      previous = next;
+    }
+  }
+
+  function pageFingerprint() {
+    const bodyText = normalizeText(document.body?.innerText || '', 6000);
+    const detailText = collectDialogs().map(dialog => dialog.text).join('|');
+    const controls = Array.from(document.querySelectorAll('input, textarea, select, [role="textbox"], [role="combobox"], [role="listbox"]'))
+      .filter(isVisible)
+      .map(element => `${element.getAttribute('aria-expanded') || ''}:${element.getAttribute('aria-selected') || ''}:${element.getAttribute('value') || ''}:${normalizeText(element.textContent, 120)}`)
+      .join('|');
+    const stepState = collectStepElements()
+      .map(element => `${element.getAttribute('aria-expanded') || ''}:${element.getAttribute('aria-selected') || ''}:${element.className || ''}`)
+      .join('|');
+    return [location.href, bodyText, detailText, controls, stepState].join('||');
+  }
+
+  function delay(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+  }
+
+  async function waitForUiChange(before, timeout = 2500) {
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      await delay(120);
+      if (pageFingerprint() !== before) return true;
+    }
+    return false;
+  }
+
+  function journalHref() {
+    const link = Array.from(document.querySelectorAll('a[href]'))
+      .filter(isVisible)
+      .find(element => /\/bundle\/history\/\d+(?:[/?#]|$)/i.test(element.href) && !/dashboard/i.test(element.href));
+    return link ? link.href : null;
+  }
+
+  function reportProgress(message) {
+    try { chrome.runtime.sendMessage({ type: 'FULL_AUDIT_PROGRESS', message }); } catch (_) { /* popup may be closed */ }
+  }
+
+  function activateElement(element) {
+    try { element.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) { /* optional */ }
+    const baseRect = element.getBoundingClientRect();
+    const band = element.__albatoClickBand;
+    const rect = band
+      ? {
+          left: baseRect.left + baseRect.width * band.left,
+          top: baseRect.top + baseRect.height * band.top,
+          width: baseRect.width * band.width,
+          height: baseRect.height * band.height
+        }
+      : (element.__albatoClickRect || baseRect);
+    const point = [rect.left + rect.width / 2, rect.top + rect.height / 2];
+    const hitTarget = element.__albatoClickRect || element.__albatoClickBand ? document.elementFromPoint(point[0], point[1]) : element;
+    const dispatchTarget = hitTarget || element;
+    element.__albatoHitTarget = dispatchTarget;
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
+      try {
+        dispatchTarget.dispatchEvent(new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: point[0],
+          clientY: point[1]
+        }));
+      } catch (_) { /* fallback to click below */ }
+    }
+    try { dispatchTarget.click(); } catch (_) { element.click(); }
+  }
+
+  function summarizeScenarioStep(step) {
+    const operation = step.operation || '';
+    const titleMatch = operation.match(/((?:GS|Email|Пауза|Фильтр)\s*\d+\s*[—–-]\s*.+)$/i);
+    return {
+      number: step.number,
+      app: step.app,
+      name: titleMatch ? normalizeText(titleMatch[1], 320) : normalizeText(operation, 320),
+      operation: normalizeText(operation, 600),
+      connection: step.connection || null,
+      enabled: step.enabled !== false
+    };
+  }
+
+  function captureScenario() {
+    const snapshot = capture('scenario');
+    return {
+      schema: 'albato-scenario/v1',
+      capture_mode: 'scenario',
+      captured_at: new Date().toISOString(),
+      read_only: true,
+      page: snapshot.page,
+      scenario: snapshot.scenario,
+      steps: (snapshot.evidence?.steps || []).map(summarizeScenarioStep),
+      evidence: {
+        active_view: snapshot.evidence?.active_view,
+        errors: snapshot.evidence?.errors || [],
+        visible_text: snapshot.evidence?.visible_text || ''
+      },
+      limits: [
+        'Считаны структура и названия видимых шагов.',
+        'Настройки модулей не открывались.',
+        'Журнал не читался.'
+      ]
+    };
+  }
+
+  function visibleTextForTest(snapshot) {
+    return [
+      snapshot?.evidence?.visible_text || '',
+      ...(snapshot?.evidence?.dialogs || []).map(dialog => dialog.text || ''),
+      ...(snapshot?.evidence?.buttons || []).map(button => `${button.text || ''} ${button.label || ''}`),
+      ...(snapshot?.evidence?.controls || []).map(control => control.value || '')
+    ].join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function findTestStepButton() {
+    const scopes = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog, [class*="drawer"], [class*="modal"], [class*="popover"]')).filter(isVisible);
+    for (const scope of scopes) {
+      const button = Array.from(scope.querySelectorAll('button, [role="button"]'))
+        .filter(isVisible)
+        .find(element => !element.disabled && /^(?:тестировать шаг|test step)$/i.test(normalizeText(element.innerText || element.textContent || '', 120)));
+      if (button) return button;
+    }
+    return null;
+  }
+
+  function findSampleOptions() {
+    const candidates = Array.from(document.querySelectorAll('button, [role="option"], [role="menuitem"], [role="button"]'))
+      .filter(isVisible)
+      .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 180) }))
+      .map(item => ({ ...item, match: item.text.match(/(?:образец|sample)\s*(\d+)/i) }))
+      .filter(item => item.match && !isDangerousAction(item.element))
+      .sort((a, b) => Number(b.match[1]) - Number(a.match[1]));
+    return candidates;
+  }
+
+  function findScopedTestButton() {
+    const scopes = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog, [class*="drawer"], [class*="modal"], [class*="popover"]')).filter(isVisible);
+    for (const scope of scopes) {
+      const button = Array.from(scope.querySelectorAll('button, [role="button"]'))
+        .filter(isVisible)
+        .find(element => !element.disabled && /^(?:протестировать|test)$/i.test(normalizeText(element.innerText || element.textContent || '', 120)));
+      if (button) return button;
+    }
+    return null;
+  }
+
+  async function runModuleTest(plannedStep) {
+    const result = {
+      requested: true,
+      status: 'not_confirmed',
+      selected_sample: null,
+      sample_options: [],
+      fallback_test_clicked: false,
+      evidence: null
+    };
+    const testStepButton = findTestStepButton();
+    if (testStepButton) {
+      const beforeTest = pageFingerprint();
+      activateElement(testStepButton);
+      await waitForUiChange(beforeTest, 2500);
+      await delay(400);
+    }
+    const samples = findSampleOptions();
+    result.sample_options = samples.map(item => item.text).slice(0, 20);
+    let snapshot = null;
+    if (samples.length) {
+      const selected = samples[0];
+      result.selected_sample = selected.text;
+      activateElement(selected.element);
+      await delay(500);
+      snapshot = capture('module-test-sample');
+    } else {
+      const testButton = findScopedTestButton();
+      if (testButton) {
+        result.fallback_test_clicked = true;
+        activateElement(testButton);
+        await delay(1200);
+        snapshot = capture('module-test-result');
+      }
+    }
+    if (!snapshot) {
+      result.status = 'not_available';
+      result.evidence = { reason: 'Кнопка теста или образцы данных в настройках не найдены.' };
+      return result;
+    }
+    const text = visibleTextForTest(snapshot);
+    const failed = /(ошиб|error|failed|не удалось|неуспеш)/i.test(text);
+    const passed = /(успеш|success|выполн|готов|получен|данные)/i.test(text);
+    result.status = failed ? 'failed' : (passed || result.selected_sample ? 'completed' : 'not_confirmed');
+    result.evidence = {
+      errors: snapshot.evidence?.errors || [],
+      dialogs: snapshot.evidence?.dialogs || [],
+      controls: snapshot.evidence?.controls || [],
+      visible_text: snapshot.evidence?.visible_text || '',
+      page: snapshot.page
+    };
+    return result;
+  }
+
+  function relatedClickableCandidates(scope) {
+    return Array.from(scope.querySelectorAll('button, [role="button"], [aria-label], [title]'))
+      .filter(isVisible)
+      .filter(element => !isDangerousAction(element));
+  }
+
+  function findModuleRelatedTarget(stepElement, kind) {
+    const cardRect = stepElement.getBoundingClientRect();
+    if (kind === 'filter') {
+      const explicitCandidates = Array.from(document.querySelectorAll('.al-step-card-wrapper-pro-mode__toolbar, [class*="bgConditionNode"], [class*="bg-bgConditionNode"], [class*="cursor-pointer"]'))
+        .filter(isVisible)
+        .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 180), rect: element.getBoundingClientRect() }))
+        .filter(item => /\bфильтр\b|\bfilter\b/i.test(item.text))
+        .filter(item => item.rect.left >= cardRect.left - 12 && item.rect.right <= cardRect.right + 12 && item.rect.top >= cardRect.top + cardRect.height * 0.55)
+        .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height) || a.text.length - b.text.length);
+      if (explicitCandidates[0]) return explicitCandidates[0].element;
+      const filterHit = document.elementFromPoint(cardRect.left + cardRect.width * 0.5, cardRect.top + cardRect.height * 1.03);
+      const filterScope = filterHit?.closest?.('[class*="bgConditionNode"], [class*="toolbar"], [class*="filter"]') || filterHit;
+      if (filterScope && isVisible(filterScope) && /фильтр|filter/i.test(normalizeText(filterScope.innerText || filterScope.textContent || '', 120))) return filterScope;
+    } else {
+      const icon = Array.from(document.querySelectorAll('button.al-icon-button, button[class*="al-icon-button"]'))
+        .filter(isVisible)
+        .map(element => ({ element, rect: element.getBoundingClientRect() }))
+        .filter(item => item.rect.left > cardRect.left + cardRect.width * 0.72 && item.rect.top >= cardRect.top + cardRect.height * 0.45 && item.rect.top <= cardRect.bottom + 20)
+        .sort((a, b) => a.rect.left - b.rect.left)[0];
+      if (icon) return icon.element;
+    }
+    const all = Array.from(document.querySelectorAll('*'))
+      .filter(isVisible)
+      .filter(element => !isDangerousAction(element));
+    if (kind === 'filter') {
+      const candidates = all
+        .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 180), rect: element.getBoundingClientRect() }))
+        .filter(item => /\bфильтр\b|\bfilter\b/i.test(item.text))
+        .filter(item => item.rect.left >= cardRect.left - 12 && item.rect.right <= cardRect.right + 12 && item.rect.top >= cardRect.top + cardRect.height * 0.55)
+        .sort((a, b) => a.text.length - b.text.length);
+      return candidates[0]?.element || null;
+    }
+    const connectionCandidates = all
+      .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 180), rect: element.getBoundingClientRect() }))
+      .filter(item => /connection to|подключени/i.test(item.text) && item.rect.left >= cardRect.left - 12 && item.rect.right <= cardRect.right + 12)
+      .sort((a, b) => a.text.length - b.text.length);
+    const connection = connectionCandidates[0];
+    if (!connection) return null;
+    const candidates = all
+      .filter(element => element !== connection.element)
+      .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 120), rect: element.getBoundingClientRect(), tag: element.tagName.toLowerCase(), role: element.getAttribute('role') || '' }))
+      .filter(item => item.rect.left >= connection.rect.right - 8 && item.rect.left <= cardRect.right + 12 && Math.abs(item.rect.top - connection.rect.top) < Math.max(30, connection.rect.height * 1.8))
+      .filter(item => item.rect.width <= 52 && item.rect.height <= 52)
+      .filter(item => !item.text || /settings|setup|настро|параметр|⚙|◈/i.test(item.text) || item.tag === 'svg' || item.role === 'button')
+      .sort((a, b) => {
+        const aPriority = a.tag === 'svg' || a.role === 'button' ? 0 : 1;
+        const bPriority = b.tag === 'svg' || b.role === 'button' ? 0 : 1;
+        return aPriority - bPriority || a.rect.left - b.rect.left;
+      });
+    return candidates[0]?.element || null;
+  }
+
+  function collectRelatedAreaDiagnostics(stepElement) {
+    const cardRect = stepElement.getBoundingClientRect();
+    const elements = Array.from(document.querySelectorAll('*')).filter(isVisible);
+    const describe = element => {
+      const rect = element.getBoundingClientRect();
+      return {
+        tag: element.tagName.toLowerCase(),
+        role: element.getAttribute('role') || null,
+        text: normalizeText(element.innerText || element.textContent || '', 180),
+        class_name: normalizeText(typeof element.className === 'string' ? element.className : '', 180),
+        rect: { left: Math.round(rect.left), top: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) }
+      };
+    };
+    const withinCard = elements
+      .filter(element => {
+        const rect = element.getBoundingClientRect();
+        return rect.left >= cardRect.left - 8 && rect.right <= cardRect.right + 8 && rect.top >= cardRect.top - 8 && rect.bottom <= cardRect.bottom + 60;
+      })
+      .map(describe)
+      .filter(item => item.text || item.role || /svg|button|path/i.test(item.tag))
+      .slice(0, 80);
+    const textMatches = elements
+      .map(describe)
+      .filter(item => /фильтр|filter|connection to|подключени|настро|параметр/i.test(item.text))
+      .slice(0, 50);
+    return {
+      document_visibility: document.visibilityState,
+      card: describe(stepElement),
+      within_card: withinCard,
+      text_matches: textMatches
+    };
+  }
+
+  async function scanModuleOneAreas(stepElement, plannedStep) {
+    const result = { requested: plannedStep.number === 1, records: [], skipped: [] };
+    if (!result.requested) return result;
+    await closeAllSafePanels();
+    const freshStepElement = findStepElement(plannedStep.number, plannedStep.raw) || stepElement;
+    result.diagnostics = collectRelatedAreaDiagnostics(freshStepElement);
+    for (const area of [
+      { kind: 'connection-extra-settings', label: 'Дополнительные настройки подключения' },
+      { kind: 'filter', label: 'Фильтр' }
+    ]) {
+      const currentStepElement = findStepElement(plannedStep.number, plannedStep.raw) || freshStepElement;
+      const target = findModuleRelatedTarget(currentStepElement, area.kind === 'filter' ? 'filter' : 'connection-extra');
+      if (!target) {
+        result.skipped.push({ kind: area.kind, reason: `Элемент «${area.label}» не найден в карточке модуля.` });
+        continue;
+      }
+      const before = pageFingerprint();
+      activateElement(target);
+      const changed = await waitForUiChange(before);
+      await delay(350);
+      const snapshot = capture(`module-${area.kind}`);
+      result.records.push({
+        kind: area.kind,
+        label: area.label,
+        opened: changed || (snapshot.ui?.dialogs || 0) > 0,
+        page: snapshot.page,
+        ui: snapshot.ui,
+        controls: snapshot.evidence?.controls || [],
+        dialogs: snapshot.evidence?.dialogs || [],
+        buttons: snapshot.evidence?.buttons || [],
+        errors: snapshot.evidence?.errors || [],
+        visible_text: snapshot.evidence?.visible_text || ''
+      });
+      await closeAllSafePanels();
+    }
+    return result;
+  }
+
+  async function captureModuleSettings(stepNumber, runTest = false) {
+    const overview = capture('scenario');
+    const plannedStep = (overview.evidence?.steps || []).map(summarizeScenarioStep).find(step => step.number === Number(stepNumber));
+    if (!plannedStep) {
+      return {
+        schema: 'albato-module-audit/v1',
+        capture_mode: 'module-debug',
+        captured_at: new Date().toISOString(),
+        read_only: true,
+        scenario: overview.scenario,
+        step: { number: Number(stepNumber) },
+        module_opened: false,
+        module_settings_opened: false,
+        module_detection: { detail_kind: 'not-found', reason: 'Шаг не найден на текущем экране.' }
+      };
+    }
+    await closeAllSafePanels();
+    const element = findStepElement(plannedStep.number, plannedStep.operation);
+    if (!element) {
+      return {
+        schema: 'albato-module-audit/v1',
+        capture_mode: 'module-debug',
+        captured_at: new Date().toISOString(),
+        read_only: true,
+        scenario: overview.scenario,
+        step: plannedStep,
+        module_opened: false,
+        module_settings_opened: false,
+        module_detection: { detail_kind: 'not-found', reason: 'Карточка шага не найдена после обновления DOM.' }
+      };
+    }
+    const titleTarget = findModuleTitleElement(element, plannedStep);
+    const before = pageFingerprint();
+    activateElement(titleTarget);
+    const changed = await waitForUiChange(before);
+    await delay(350);
+    const snapshot = capture('module-debug');
+    const detection = moduleEvidence(overview, snapshot, changed, plannedStep);
+    const test = runTest
+      ? (detection.module_settings_opened ? await runModuleTest(plannedStep) : { requested: true, status: 'not_available', evidence: { reason: 'Настройки модуля не открылись, тест не запускался.' } })
+      : { requested: false, status: 'not_requested' };
+    const subSettings = await scanModuleOneAreas(element, plannedStep);
+    const result = {
+      schema: 'albato-module-audit/v1',
+      capture_mode: 'module-debug',
+      test_requested: Boolean(runTest),
+      captured_at: new Date().toISOString(),
+      read_only: !runTest,
+      page: snapshot.page,
+      scenario: overview.scenario,
+      step: plannedStep,
+      click_target: elementDescriptor(titleTarget),
+      module_opened: detection.opened,
+      module_settings_opened: detection.module_settings_opened,
+      module_detection: detection,
+      test,
+      sub_settings: subSettings,
+      settings: {
+        controls: snapshot.evidence?.controls || [],
+        dialogs: snapshot.evidence?.dialogs || [],
+        buttons: snapshot.evidence?.buttons || [],
+        errors: snapshot.evidence?.errors || [],
+        save_indicators: snapshot.evidence?.save_indicators || {},
+        test_and_data: snapshot.evidence?.test_and_data || {},
+        visible_text: snapshot.evidence?.visible_text || ''
+      },
+      limits: [
+        'Снят только выбранный модуль.',
+        runTest ? 'Тест модуля был запрошен пользователем; сохранение настроек не выполнялось.' : 'Сохранение и тестирование не выполнялись.',
+        'Наличие кнопки «Сохранить» не является доказательством сохраненности.'
+      ]
+    };
+    await closeAllSafePanels();
+    return result;
+  }
+
+  async function runFullAudit(includeJournal = false) {
+    const started = new Date().toISOString();
+    const overview = capture('overview');
+    const stepPlan = collectStepElements().map(stepElementData).filter(step => step.number !== null);
+    const modules = [];
+    const skipped = [];
+    reportProgress(`Найдено шагов: ${stepPlan.length}. Начинаю read-only обход.`);
+
+    for (const plannedStep of stepPlan) {
+      const element = findStepElement(plannedStep.number, plannedStep.raw);
+      if (!element) {
+        skipped.push({ step: plannedStep, reason: 'Карточка шага не найдена после обновления DOM.' });
+        continue;
+      }
+      const titleTarget = findModuleTitleElement(element, plannedStep);
+      reportProgress(`Открываю шаг ${plannedStep.number}: ${plannedStep.app || plannedStep.operation}`);
+      const baseline = overview;
+      let before = pageFingerprint();
+      activateElement(titleTarget);
+      let changed = await waitForUiChange(before);
+      await delay(350);
+      let snapshot = capture('module');
+      let detection = moduleEvidence(baseline, snapshot, changed, plannedStep);
+
+      snapshot.step = plannedStep;
+      snapshot.click_target = elementDescriptor(titleTarget);
+      snapshot.module_opened = detection.opened;
+      snapshot.module_settings_opened = detection.module_settings_opened;
+      snapshot.module_detection = detection;
+      if (plannedStep.number === 1) snapshot.sub_settings = await scanModuleOneAreas(element, plannedStep);
+      if (!detection.module_settings_opened) {
+        skipped.push({ step: plannedStep, reason: detection.reason });
+      }
+      modules.push(snapshot);
+      await closeAllSafePanels();
+    }
+
+    let journal = null;
+    if (includeJournal) {
+      const href = journalHref();
+      if (href && detectView() === 'constructor') {
+        reportProgress('Открываю журнал в отдельной фоновой вкладке без изменения текущей страницы.');
+        try {
+          const response = await chrome.runtime.sendMessage({ type: 'CAPTURE_JOURNAL', url: href });
+          if (response?.ok) journal = response.audit;
+          else skipped.push({ area: 'journal', reason: response?.error || 'Журнал не вернул данные.' });
+        } catch (error) {
+          skipped.push({ area: 'journal', reason: error?.message || String(error) });
+        }
+      } else if (detectView() === 'journal') {
+        journal = capture('journal');
+      } else {
+        skipped.push({ area: 'journal', reason: 'Ссылка на журнал не найдена на текущем экране.' });
+      }
+    } else {
+      reportProgress('Проверка журнала отключена переключателем.');
+    }
+
+    const result = {
+      schema: 'albato-audit/v2',
+      capture_mode: 'full',
+      captured_at: new Date().toISOString(),
+      started_at: started,
+      read_only: true,
+      source: { kind: 'chrome-extension-autonomous-read-only-audit', page_url: location.href },
+      options: { include_journal: Boolean(includeJournal) },
+      scenario: overview.scenario,
+      overview,
+      modules,
+      journal,
+      summary: {
+        planned_steps: stepPlan.length,
+        attempted_modules: modules.length,
+        opened_modules: modules.filter(module => module.module_opened).length,
+        unopened_modules: modules.filter(module => !module.module_opened).length,
+        configured_modules: modules.filter(module => module.module_detection?.module_settings_opened).length,
+        connection_only_modules: modules.filter(module => module.module_detection?.detail_kind === 'connection-settings').length,
+        unconfirmed_module_settings: modules.filter(module => !module.module_detection?.module_settings_opened).length,
+        skipped_items: skipped.length,
+        journal_requested: Boolean(includeJournal),
+        journal_captured: Boolean(journal && journal.page?.readability?.status === 'readable')
+      },
+      skipped,
+      limits: [
+        'Расширение нажимает только на карточки шагов и безопасные кнопки закрытия.',
+        'Кнопки сохранения, запуска, тестирования, сброса и удаления заблокированы для обхода.',
+        'Наличие значения на экране не является самостоятельным доказательством сохранения.',
+        'Если Albato не отдает значение в DOM или доступном журнале, оно отмечается как непроверенное.'
+      ]
+    };
+    await chrome.storage.local.set({ latestAudit: result, latestFullAudit: result });
+    reportProgress(`Готово: открыто модулей ${result.summary.opened_modules}/${stepPlan.length}, настройки подтверждены для ${result.summary.configured_modules}, журнал: ${result.summary.journal_captured ? 'прочитан' : 'не подтвержден'}.`);
+    return result;
+  }
+
+  function detectView() {
+    const path = location.pathname.toLowerCase();
+    if (/\/bundle\/history\/\d+\/dashboard/.test(path)) return 'analytics';
+    if (/\/bundle\/history\/\d+/.test(path)) return 'journal';
+    if (/\/bundle\/edit\/\d+/.test(path)) return 'constructor';
+    return 'unknown';
+  }
+
+  function collectStepCards(buttons) {
+    return buttons
+      .filter(item => /^\d+\.\s*/.test(item.text))
+      .map(item => {
+        const header = item.text.split(/Connection to/i)[0].trim();
+        const match = header.match(/^(\d+)\.\s*([^:]+):\s*(.*)$/);
+        const connection = item.text.match(/(Connection to .+?)(?=Фильтр|Миграция|$)/i);
+        return {
+          number: match ? Number(match[1]) : null,
+          app: match ? normalizeText(match[2], 120) : null,
+          operation: match ? normalizeText(match[3], 500) : header,
+          connection: connection ? normalizeText(connection[1], 220) : null,
+          enabled: !/(отключен|disabled|выключен)/i.test(item.text),
+          raw: item.text
+        };
+      })
+      .slice(0, MAX_ITEMS);
+  }
+
+  function collectTables() {
+    const tables = Array.from(document.querySelectorAll('table, [role="grid"]'))
+      .filter(isVisible)
+      .map((table, index) => {
+        const headers = Array.from(table.querySelectorAll('thead th, [role="columnheader"]'))
+          .map(cell => redact(cell.textContent, 'table-header', 180))
+          .filter(Boolean)
+          .slice(0, 40);
+        const rows = Array.from(table.querySelectorAll('tbody tr, [role="row"]'))
+          .filter(isVisible)
+          .map(row => Array.from(row.querySelectorAll('th, td, [role="gridcell"], [role="cell"]'))
+            .map(cell => redact(cell.textContent, 'table-cell', 500))
+            .filter(Boolean))
+          .filter(row => row.length)
+          .slice(0, MAX_TABLE_ROWS);
+        return { index: index + 1, headers, rows };
+      })
+      .filter(table => table.headers.length || table.rows.length);
+    return tables;
+  }
+
+  function collectSaveIndicators(buttons, visibleText) {
+    const controls = buttons
+      .filter(item => /(save|saved|unsaved|сохран|изменен|применить)/i.test(`${item.text} ${item.label}`))
+      .slice(0, 20);
+    const markers = visibleText
+      .split(/\s{2,}|[.!?]\s+/)
+      .map(value => normalizeText(value, 220))
+      .filter(value => /(save|saved|unsaved|сохран|изменен|применить)/i.test(value))
+      .slice(0, 20);
+    return { controls, markers };
+  }
+
+  function collectTestAndDataEvidence(visibleText, dialogs, buttons, controls) {
+    const sources = [
+      visibleText || '',
+      ...(dialogs || []).map(dialog => dialog.text || ''),
+      ...(buttons || []).map(button => `${button.text || ''} ${button.label || ''}`),
+      ...(controls || []).map(control => `${control.label || ''} ${control.value || ''} ${control.placeholder || ''}`)
+    ];
+    const text = sources.join(' | ').replace(/\s+/g, ' ').trim();
+    const testMatches = text.match(/[^|.!?]*(?:тест|test|протестир|успешно|success|failed|ошибк|error)[^|.!?]*/gi) || [];
+    const dataMatches = text.match(/[^|.!?]*(?:данн|data|sample|payload|input|output|получен|сохранен)[^|.!?]*/gi) || [];
+    const testFailed = /(тест[^.]{0,80}(?:ошиб|не удалось|неуспеш)|test[^.]{0,80}(?:fail|error)|failed|error)/i.test(text);
+    const testPassed = /(тест[^.]{0,80}(?:успеш|пройден|выполн)|test[^.]{0,80}(?:pass|success)|данные получены|получены данные)/i.test(text);
+    const emptyData = /(нет данных|данные отсутствуют|данных нет|пуст(?:о|ые)|no data|empty)/i.test(text);
+    const availableData = /(тестовые данные|sample data|payload|input data|output data|данные получены|получены данные|сохраненн(?:ые|ых) данные|доступн(?:ые|ы) данн)/i.test(text);
+    const saveVisible = (buttons || []).some(button => /(save|сохранить)/i.test(`${button.text || ''} ${button.label || ''}`));
+    const savedMarker = /(настройки сохранены|сохранено|saved successfully|settings saved)/i.test(text);
+    return {
+      testing: {
+        status: testFailed ? 'failed' : (testPassed ? 'passed' : 'not_confirmed'),
+        evidence: [...new Set(testMatches.map(value => normalizeText(value, 260)).filter(Boolean))].slice(0, 12)
+      },
+      operational_data: {
+        status: emptyData ? 'empty' : (availableData ? 'available' : 'not_confirmed'),
+        evidence: [...new Set(dataMatches.map(value => normalizeText(value, 300)).filter(Boolean))].slice(0, 12)
+      },
+      settings: {
+        status: savedMarker ? 'saved_marker_visible' : 'not_confirmed',
+        save_control_visible: saveVisible
+      }
+    };
+  }
+
+  function assessReadability(activeView, visibleText, tables, dialogs) {
+    const text = String(visibleText || '');
+    if (activeView === 'journal') {
+      if (document.visibilityState === 'hidden') {
+        return { status: 'not_readable', reason: 'Страница журнала снята в hidden-вкладке; пустой или неполный результат нельзя считать подтверждением.' };
+      }
+      const journalMarkers = /(нет\s+(?:запусков|выполнений)|запуск(?:ов|и|а)?\s*[:#]?\s*\d+|выполнени[ея]|execution|history\s+(?:of|log)|ошиб(?:ка|ки|ок)\s*[:#]?|успешн(?:о|ых)|success(?:ful)?|error\s*[:#]?)/i.test(text);
+      if (tables.length || (journalMarkers && text.length >= 250)) {
+        return { status: 'readable', reason: 'Найдены строки/таблица или характерные элементы журнала.' };
+      }
+      return { status: 'not_confirmed', reason: 'Не найдены строки, таблица или достаточные признаки журнала.' };
+    }
+    if (text.length >= 250 || dialogs.length || tables.length) {
+      return { status: 'readable', reason: 'Страница содержит доступный текст или детали модуля.' };
+    }
+    return { status: 'not_confirmed', reason: 'На странице доступно слишком мало содержимого для уверенного аудита.' };
+  }
+
+  function capture(mode = 'screen') {
+    const identity = pageIdentity();
+    const controls = collectControls();
+    const buttons = collectButtons();
+    const headings = collectHeadings();
+    const errors = collectMessages();
+    const visibleText = collectVisibleText();
+    const activeView = detectView();
+    const steps = collectStepCards(buttons);
+    const tables = collectTables();
+    const dialogs = collectDialogs();
+    const saveIndicators = collectSaveIndicators(buttons, visibleText);
+    const testAndData = collectTestAndDataEvidence(visibleText, dialogs, buttons, controls);
+    const readability = assessReadability(activeView, visibleText, tables, dialogs);
+    const audit = {
+      schema: 'albato-audit/v1',
+      capture_mode: mode,
+      captured_at: new Date().toISOString(),
+      read_only: true,
+      source: {
+        kind: 'chrome-extension-visible-page',
+        visibility: document.visibilityState,
+        frame: window.top === window ? 'top' : 'nested'
+      },
+      page: {
+        ...identity,
+        active_view: activeView,
+        readability
+      },
+      scenario: {
+        name: identity.name,
+        id: extractScenarioId(location.pathname),
+        status: findStatus(visibleText, buttons)
+      },
+      ui: {
+        form_controls: controls.length,
+        buttons: buttons.length,
+        headings: headings.length,
+        steps: steps.length,
+        tables: tables.length,
+        dialogs: dialogs.length,
+        visible_text_chars: visibleText.length
+      },
+      evidence: {
+        active_view: activeView,
+        headings,
+        steps,
+        controls,
+        tables,
+        dialogs,
+        buttons,
+        errors,
+        save_indicators: saveIndicators,
+        test_and_data: testAndData,
+        step_hints: collectStepHints(headings, buttons, visibleText),
+        visible_text: visibleText
+      },
+      limits: [
+        'Снята только текущая загруженная страница и раскрытые на ней элементы.',
+        'Закрытые/нераскрытые модули не проверялись.',
+        'Новые тесты, сохранения и внешние записи не выполнялись.',
+        'Наличие кнопки или значения на экране не доказывает, что настройка сохранена.'
+      ],
+      redactions: [
+        'Секретные поля и значения замаскированы.',
+        'Токены в Bearer/JWT/query-параметрах замаскированы.'
+      ]
+    };
+    return audit;
+  }
+
+  function extractScenarioId(url) {
+    const value = String(url || '');
+    const bundleMatch = value.match(/\/bundle\/edit\/(\d+)/i);
+    if (bundleMatch) return bundleMatch[1];
+    const numericSegments = value.match(/\/(\d+)(?:\/|$)/g);
+    return numericSegments ? numericSegments[numericSegments.length - 1].replace(/\//g, '') : null;
+  }
+
+  function findStatus(text, buttons) {
+    const candidates = [...buttons.map(item => item.text), text.slice(0, 1600)];
+    const status = candidates.join(' ').match(/\b(active|paused|draft|error|enabled|disabled|активн\w*|пауза|черновик|ошиб\w*|включен\w*|выключен\w*)\b/i);
+    return status ? status[1] : 'not-confirmed';
+  }
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === 'CAPTURE_SCENARIO') {
+      try {
+        sendResponse({ ok: true, audit: captureScenario() });
+      } catch (error) {
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      }
+      return true;
+    }
+    if (message?.type === 'CAPTURE_MODULE_SETTINGS') {
+      captureModuleSettings(message.step_number, message.run_test === true)
+        .then(audit => sendResponse({ ok: true, audit }))
+        .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
+      return true;
+    }
+    if (message?.type === 'CAPTURE_AUDIT') {
+      try {
+        sendResponse({ ok: true, audit: capture(message.mode || 'screen') });
+      } catch (error) {
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      }
+      return true;
+    }
+    if (message?.type === 'RUN_FULL_AUDIT') {
+      runFullAudit(message.include_journal === true)
+        .then(audit => sendResponse({ ok: true, audit }))
+        .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
+      return true;
+    }
+    return undefined;
+  });
+})();

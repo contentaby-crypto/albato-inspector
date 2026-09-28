@@ -1,0 +1,23 @@
+# Local/browser artifacts
+ScreenShot/
+screenshots/
+attachments/
+*.zip
+*.log
+*.tmp
+*.audit.json
+
+# Duplicate unpacked copy kept only for local Chrome compatibility
+albato-inspector-mvp/
+
+# Generated/dependency files
+node_modules/
+dist/
+.cache/
+__pycache__/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
