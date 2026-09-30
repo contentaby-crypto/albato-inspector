@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Albato Inspector MVP",
-  "version": "0.4.19",
+  "version": "0.4.34",
   "description": "Read-only capture of the visible Albato page for audit by an AI agent.",
   "action": {
     "default_title": "Albato Inspector",

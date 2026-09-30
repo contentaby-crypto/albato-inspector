@@ -20,8 +20,17 @@
       Откройте нужную связку в Albato. «Прочитать сценарий» покажет модули, а кнопка на модуле позволит отдельно снять его настройки. Read-only: сохранения и тесты не выполняются.
     </section>
 
-    <button id="capture" class="primary">Прочитать сценарий</button>
-    <button id="full-audit" class="full-audit">Запустить полный аудит</button>
+    <section class="capture-actions" aria-label="Проверка связки">
+      <button id="capture" class="primary" type="button">Прочитать сценарий</button>
+      <button id="full-audit" class="full-audit" type="button">Запустить полный аудит</button>
+    </section>
+
+    <section class="journal-section" aria-labelledby="journal-title">
+      <h2 id="journal-title">Журнал запусков</h2>
+      <p class="journal-hint">Выберите период в Albato и дождитесь загрузки записей.</p>
+      <button id="capture-open-journal" class="journal-button" type="button">Снять открытый журнал</button>
+      <p class="journal-note">Читает текущую вкладку. Полный аудит открывает журнал с периодом по умолчанию.</p>
+    </section>
 
     <label class="option test-option">
       <input id="run-tests" type="checkbox">
@@ -46,7 +55,7 @@
       <pre id="preview">Данные появятся после захвата.</pre>
     </details>
 
-    <footer>Версия 0.4.19 · albato-audit/v2</footer>
+    <footer>Версия 0.4.34 · albato-audit/v2</footer>
   </main>
   <script src="popup.js"></script>
 </body>

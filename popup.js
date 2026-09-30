@@ -1,5 +1,6 @@
 const captureButton = document.querySelector('#capture');
 const fullAuditButton = document.querySelector('#full-audit');
+const captureOpenJournalButton = document.querySelector('#capture-open-journal');
 const journalToggle = document.querySelector('#include-journal');
 const runTestsToggle = document.querySelector('#run-tests');
 const copyButton = document.querySelector('#copy');
@@ -16,6 +17,33 @@ const moduleAudits = new Map();
 chrome.storage.local.get({ includeJournal: false, runModuleTests: false }).then(values => {
   journalToggle.checked = Boolean(values.includeJournal);
   runTestsToggle.checked = Boolean(values.runModuleTests);
+});
+
+// Chrome closes an extension popup when the journal tab becomes active.
+// The content script completes the audit independently; restore it on reopening.
+chrome.storage.local.get(['fullAuditState', 'latestFullAudit']).then(({ fullAuditState, latestFullAudit }) => {
+  if (fullAuditState?.status === 'running') {
+    setStatus('Аудит продолжается после закрытия окна расширения. Откройте его снова через несколько секунд.');
+  } else if (fullAuditState?.status === 'failed') {
+    setStatus(`Аудит прерван: ${fullAuditState.error || 'причина не указана'}.`, true);
+  } else if (fullAuditState?.status === 'completed' && latestFullAudit?.started_at === fullAuditState.started_at) {
+    renderAudit(latestFullAudit);
+    setStatus(latestFullAudit.summary?.journal_captured
+      ? (latestFullAudit.journal?.summary?.journal_details_complete ? 'Аудит и все «Детали» журнала восстановлены.' : 'Журнал доступен, но чтение «Деталей» неполное; проверьте причины пропусков в JSON.')
+      : 'Аудит восстановлен; чтение журнала не подтверждено.');
+  }
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.fullAuditState) return;
+  const state = changes.fullAuditState.newValue;
+  if (state?.status === 'completed') {
+    chrome.storage.local.get('latestFullAudit').then(({ latestFullAudit }) => {
+      if (latestFullAudit?.started_at === state.started_at) renderAudit(latestFullAudit);
+    });
+  } else if (state?.status === 'failed') {
+    setStatus(`Аудит прерван: ${state.error || 'причина не указана'}.`, true);
+  }
 });
 
 journalToggle.addEventListener('change', () => {
@@ -168,8 +196,15 @@ function renderAudit(audit) {
   const configured = audit.summary?.configured_modules ?? captured;
   const tables = audit.summary?.journal_captured ? (audit.journal?.ui?.tables ?? 0) : (source?.ui?.tables ?? 0);
   const view = source?.page?.active_view || 'unknown';
+  const journal = audit.schema === 'albato-audit/v2' ? audit.journal : (view === 'journal' ? audit : null);
+  const runCount = journal?.summary?.journal_runs_seen ?? '?';
+  const detailCount = journal?.summary?.journal_details_read ?? 0;
+  const detailSkipped = journal?.summary?.journal_details_skipped ?? 0;
+  const journalStatus = !audit.summary?.journal_requested ? 'журнал не запрошен'
+    : !audit.summary?.journal_captured ? 'журнал не подтверждён'
+    : `журнал: ${runCount} запусков · Детали: ${detailCount} · ${journal?.summary?.journal_details_complete === true ? 'полностью прочитаны' : `неполно (${detailSkipped} пропусков)`}`;
   summaryNode.textContent = audit.schema === 'albato-audit/v2'
-    ? `${scenario} · полный аудит · открыто: ${captured}/${steps} · настройки: ${configured}/${steps} · таблиц журнала: ${tables} · пропущено: ${audit.summary?.skipped_items ?? 0}`
+    ? `${scenario} · полный аудит · открыто: ${captured}/${steps} · настройки: ${configured}/${steps} · ${journalStatus} · пропущено: ${audit.summary?.skipped_items ?? 0}`
     : `${scenario} · экран: ${view} · шагов: ${steps} · таблиц: ${tables} · полей: ${controls} · ошибок: ${errors}`;
   badgeNode.textContent = 'снято';
 }
@@ -196,6 +231,29 @@ captureButton.addEventListener('click', async () => {
   } finally {
     captureButton.disabled = false;
     fullAuditButton.disabled = false;
+  }
+});
+
+captureOpenJournalButton.addEventListener('click', async () => {
+  captureOpenJournalButton.disabled = true;
+  setStatus('Читаю открытый журнал с выбранным в Albato периодом…');
+  try {
+    const tab = await activeTab();
+    if (!/^https:\/\/(?:[^/]+\.)?albato\.(?:com|ru)\/bundle\/history\/\d+(?:[/?#]|$)/i.test(tab.url || '')) {
+      throw new Error('Откройте Журнал конкретной связки и выберите период в Albato.');
+    }
+    const response = await chrome.tabs.sendMessage(tab.id, { type: 'CAPTURE_AUDIT', mode: 'journal' });
+    if (!response?.ok || !response.audit) throw new Error(response?.error || 'Журнал не вернул данные.');
+    const audit = response.audit;
+    if (audit.page?.readability?.status !== 'readable') throw new Error('Журнал ещё не загрузил записи; дождитесь их появления и повторите.');
+    audit.options = { journal_period_source: 'current_open_tab', period_boundaries_verified: false };
+    audit.limits.push('Период устанавливается пользователем в Albato; расширение не проверяет его границы. Обработаны только загруженные записи текущей страницы (лимит обхода — 60 запусков).');
+    renderAudit(audit);
+    setStatus(`Снят текущий журнал: ${audit.summary?.journal_runs_seen ?? '?'} видимых запусков, ${audit.summary?.journal_details_read ?? 0} подтверждённых окон «Детали». Проверьте пропуски и границы периода.`);
+  } catch (error) {
+    setStatus(error?.message || String(error), true);
+  } finally {
+    captureOpenJournalButton.disabled = false;
   }
 });
 

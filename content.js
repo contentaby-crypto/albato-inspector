@@ -18,6 +18,7 @@
     if (SENSITIVE_NAME.test(hint)) return '[masked]';
     return text
       .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [masked]')
+      .replace(/((?:токен\s+(?:запроса|доступа)|token|access[_ -]?token|api[_ -]?key)\s*(?:[:=]\s*|\s+))[^\s,;]+/gi, '$1[masked]')
       .replace(/([?&](?:token|key|secret|password|auth|signature)=)[^&\s]+/gi, '$1[masked]')
       .replace(/\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}\b/g, '[jwt-masked]')
       .slice(0, max);
@@ -612,6 +613,14 @@
   }
 
   function findModuleRelatedTarget(stepElement, kind) {
+    if (kind === 'filter') {
+      const globalFilterCandidates = Array.from(document.querySelectorAll('[class*="bgConditionNode"], [class*="bg-bgConditionNode"], [class*="toolbar"]'))
+        .filter(isVisible)
+        .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 120), rect: element.getBoundingClientRect() }))
+        .filter(item => /\bфильтр\b|\bfilter\b/i.test(item.text))
+        .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+      if (globalFilterCandidates[0]) return globalFilterCandidates[0].element;
+    }
     const cardRect = stepElement.getBoundingClientRect();
     if (kind === 'filter') {
       const explicitCandidates = Array.from(document.querySelectorAll('.al-step-card-wrapper-pro-mode__toolbar, [class*="bgConditionNode"], [class*="bg-bgConditionNode"], [class*="cursor-pointer"]'))
@@ -812,6 +821,8 @@
 
   async function runFullAudit(includeJournal = false) {
     const started = new Date().toISOString();
+    await chrome.storage.local.set({ fullAuditState: { status: 'running', started_at: started, page_url: location.href } });
+    try {
     const overview = capture('overview');
     const stepPlan = collectStepElements().map(stepElementData).filter(step => step.number !== null);
     const modules = [];
@@ -888,9 +899,13 @@
         configured_modules: modules.filter(module => module.module_detection?.module_settings_opened).length,
         connection_only_modules: modules.filter(module => module.module_detection?.detail_kind === 'connection-settings').length,
         unconfirmed_module_settings: modules.filter(module => !module.module_detection?.module_settings_opened).length,
-        skipped_items: skipped.length,
+        skipped_items: skipped.length + (journal?.summary?.journal_details_skipped || 0),
         journal_requested: Boolean(includeJournal),
-        journal_captured: Boolean(journal && journal.page?.readability?.status === 'readable')
+        journal_captured: Boolean(journal && journal.page?.readability?.status === 'readable'),
+        journal_runs_seen: journal?.summary?.journal_runs_seen ?? null,
+        journal_details_read: journal?.summary?.journal_details_read ?? 0,
+        journal_details_skipped: journal?.summary?.journal_details_skipped ?? 0,
+        journal_details_complete: journal?.summary?.journal_details_complete === true
       },
       skipped,
       limits: [
@@ -900,9 +915,14 @@
         'Если Albato не отдает значение в DOM или доступном журнале, оно отмечается как непроверенное.'
       ]
     };
-    await chrome.storage.local.set({ latestAudit: result, latestFullAudit: result });
+    await chrome.storage.local.set({ latestAudit: result, latestFullAudit: result,
+      fullAuditState: { status: 'completed', started_at: started, captured_at: result.captured_at, page_url: location.href } });
     reportProgress(`Готово: открыто модулей ${result.summary.opened_modules}/${stepPlan.length}, настройки подтверждены для ${result.summary.configured_modules}, журнал: ${result.summary.journal_captured ? 'прочитан' : 'не подтвержден'}.`);
     return result;
+    } catch (error) {
+      await chrome.storage.local.set({ fullAuditState: { status: 'failed', started_at: started, page_url: location.href, error: error?.message || String(error) } });
+      throw error;
+    }
   }
 
   function detectView() {
@@ -965,6 +985,276 @@
     return { controls, markers };
   }
 
+  function collectJournalRows(activeView, visibleText) {
+    if (activeView !== 'journal') return [];
+    const header = /дата\s*\/\s*время\s+сервис\s+результат\s+статус/i.exec(visibleText);
+    if (!header) return [];
+    const body = visibleText.slice(header.index + header[0].length);
+    const dates = Array.from(body.matchAll(/\b\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}(?::\d{2})?\b/g));
+    return dates.slice(0, MAX_TABLE_ROWS).map((match, index) => {
+      const detail = body.slice(match.index + match[0].length, dates[index + 1]?.index ?? body.length).trim();
+      const status = detail.match(/(?:Успех|Ошибка|Выполняется|Отменено|Success|Error|Failed|Running)\s*$/i)?.[0] || null;
+      const step = detail.match(/^(\d+)\.\s+/);
+      return {
+        date_time: match[0],
+        kind: step ? 'step' : 'execution',
+        step_number: step ? Number(step[1]) : null,
+        result: redact(detail.replace(/\s+(?:Успех|Ошибка|Выполняется|Отменено|Success|Error|Failed|Running)\s*$/i, ''), 'journal-result', 600),
+        status,
+        complete: Boolean(status)
+      };
+    }).filter(row => row.complete && (row.kind === 'step' || /Связка отработала|execution/i.test(row.result)));
+  }
+
+  function diagnoseJournalDom() {
+    if (detectView() !== 'journal' || document.visibilityState !== 'visible') {
+      throw new Error('Откройте видимую вкладку Журнал нужной связки.');
+    }
+    const describe = node => {
+      if (!(node instanceof Element)) return null;
+      const rect = node.getBoundingClientRect();
+      return {
+        tag: node.tagName.toLowerCase(),
+        class_name: String(node.className?.baseVal || node.className || '').slice(0, 200),
+        role: node.getAttribute('role'),
+        aria_label: redact(node.getAttribute('aria-label') || '', 'label', 100),
+        aria_expanded: node.getAttribute('aria-expanded'),
+        data_testid: redact(node.getAttribute('data-testid') || '', 'attribute', 100),
+        visible: isVisible(node),
+        rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+        child_buttons: Array.from(node.querySelectorAll('button, [role="button"]')).slice(0, 8).map(button => ({
+          tag: button.tagName.toLowerCase(), class_name: String(button.className?.baseVal || button.className || '').slice(0, 150),
+          label: redact(button.getAttribute('aria-label') || button.getAttribute('title') || '', 'label', 100),
+          text: redact(button.innerText || '', 'button', 80), expanded: button.getAttribute('aria-expanded')
+        }))
+      };
+    };
+    const ancestry = (node, depth = 7) => {
+      const result = [];
+      for (let element = node, n = 0; element && n < depth; element = element.parentElement, n += 1) result.push(describe(element));
+      return result;
+    };
+    const datePattern = /^\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}(?::\d{2})?$/;
+    const textWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const dateNodes = [];
+    for (let textNode = textWalker.nextNode(); textNode && dateNodes.length < 4; textNode = textWalker.nextNode()) {
+      if (datePattern.test(normalizeText(textNode.nodeValue, 40)) && isVisible(textNode.parentElement)) dateNodes.push(textNode.parentElement);
+    }
+    const dates = dateNodes.map(node => ({ date_time: normalizeText(node.textContent, 40), ancestors: ancestry(node) }));
+    const details = Array.from(document.querySelectorAll('button, [role="button"]'))
+      .filter(isVisible).filter(node => /^Детали$/i.test(normalizeText(node.innerText || node.textContent || '', 40)))
+      .slice(0, 3).map(node => ({ ancestors: ancestry(node) }));
+    const panels = Array.from(document.querySelectorAll('.al-modal, .al-modal__header, .al-modal__content'))
+      .filter(isVisible).slice(0, 5).map(node => ({ structure: describe(node),
+        header_controls: Array.from(node.matches('.al-modal__header') ? node.querySelectorAll('*') :
+          (node.querySelector('.al-modal__header')?.querySelectorAll('*') || []))
+          .filter(child => child.matches('button, [role="button"], [title], [aria-label], [class*="close"], svg, [class*="icon"]'))
+          .slice(0, 20).map(describe),
+        headings: Array.from(node.querySelectorAll('h1,h2,h3,[role="heading"]')).slice(0, 6)
+          .map(h => redact(h.textContent, 'heading', 100)) }));
+    const eventContainers = Array.from(document.querySelectorAll('.al-bundle-history-table__event-container')).filter(isVisible);
+    const events = eventContainers.slice(0, 5).map((container, index) => {
+      const structural = node => ({
+        ...describe(node),
+        children: Array.from(node.children).slice(0, 12).map(child => ({
+          tag: child.tagName.toLowerCase(),
+          class_name: String(child.className?.baseVal || child.className || '').slice(0, 200),
+          role: child.getAttribute('role'),
+          aria_expanded: child.getAttribute('aria-expanded'),
+          visible: isVisible(child),
+          child_count: child.children.length
+        }))
+      });
+      const header = Array.from(container.children).find(child => !child.classList.contains('al-bundle-history-table__step-list')) || container.firstElementChild;
+      const headerNodes = header ? [header, ...Array.from(header.querySelectorAll('*')).slice(0, 45)] : [];
+      return {
+        index: index + 1,
+        container: structural(container),
+        header: header ? structural(header) : null,
+        header_nodes: headerNodes.filter(node => node !== header &&
+          (node.matches('button, [role="button"], [aria-expanded], [class*="arrow"], [class*="chevron"], [class*="expand"], svg') || node.children.length === 0))
+          .slice(0, 25).map(structural),
+        step_containers: container.querySelectorAll('.al-bundle-history-table__step-container').length,
+        details_buttons: Array.from(container.querySelectorAll('button.al-bundle-history-table__details-button')).filter(isVisible).length
+      };
+    });
+    return {
+      schema: 'albato-journal-dom-diagnostic/v2', captured_at: new Date().toISOString(),
+      read_only: true, interactions: 0, route: location.pathname,
+      scenario_id: extractScenarioId(location.pathname),
+      evidence: { dates, details, panels, events, event_containers_total: eventContainers.length,
+        table_rows: document.querySelectorAll('tr, [role="row"]').length },
+      limits: ['Ни одна кнопка не нажата: снимок фиксирует только текущее состояние DOM.',
+        'Сравните events до и после ручного раскрытия одной и той же записи.',
+        'Показаны первые пять контейнеров; текст полей и содержимое панели намеренно не включены.']
+    };
+  }
+
+  function journalEventContainers() {
+    return Array.from(document.querySelectorAll('.al-bundle-history-table__event-container')).filter(isVisible);
+  }
+
+  function journalEventExpanded(container) {
+    const list = container?.querySelector('.al-bundle-history-table__step-list');
+    return Boolean(container?.classList.contains('al-bundle-history-table__event-container_expanded') &&
+      list && !list.classList.contains('rah-static--height-zero') && isVisible(list));
+  }
+
+  function journalDetailsPanel() {
+    return Array.from(document.querySelectorAll('.al-modal__content')).find(isVisible) || null;
+  }
+
+  async function waitForJournalState(check, timeout = 2500) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      if (check()) return true;
+      await delay(100);
+    }
+    return Boolean(check());
+  }
+
+  // Albato mounts the modal before its asynchronous payload has finished updating.
+  // Never associate the first nonempty text with the clicked step.
+  async function settledJournalDetails(previousText, expectedSummary) {
+    const started = Date.now();
+    let lastText = '';
+    let changedAt = Date.now();
+    while (Date.now() - started < 4500) {
+      const panel = journalDetailsPanel();
+      const text = normalizeText(panel?.innerText || '', 12001);
+      if (text !== lastText) { lastText = text; changedAt = Date.now(); }
+      const runTime = (expectedSummary.match(/\b\d{2}\.\d{2}\.\d{4}\s+(\d{2}:\d{2}:\d{2})/) || [])[1];
+      const payloadTime = (text.match(/Дата и время запроса\s+\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2}:\d{2})/) || [])[1];
+      if (text && text !== previousText && Date.now() - changedAt >= 550 &&
+          (!runTime || !payloadTime || runTime === payloadTime)) return { panel, text };
+      await delay(100);
+    }
+    return null;
+  }
+
+  async function closeJournalDetails() {
+    const panel = journalDetailsPanel();
+    if (!panel) return true;
+    const modal = panel.closest('.al-modal');
+    // Confirmed by the user's no-click DOM diagnostic: a div, not a button.
+    const closeIcons = Array.from(modal?.querySelectorAll('.al-modal__header .al-modal__control.icon-close') || []).filter(isVisible);
+    if (closeIcons.length !== 1) return false;
+    closeIcons[0].click();
+    return waitForJournalState(() => !journalDetailsPanel());
+  }
+
+  async function captureJournalDeep() {
+    const audit = capture('journal');
+    if (audit.page.active_view !== 'journal' || document.visibilityState !== 'visible') return audit;
+    const records = [];
+    const skipped = [];
+    const total = journalEventContainers().length;
+    const limit = Math.min(total, MAX_TABLE_ROWS);
+    let blocked = false;
+    let previousDetailsText = '';
+    if (journalDetailsPanel()) {
+      skipped.push({ reason: 'Открыто окно «Детали»; закройте его перед обходом.' });
+      blocked = true;
+    }
+    for (let index = 0; index < limit && !blocked; index += 1) {
+      const container = journalEventContainers()[index];
+      if (!container) { skipped.push({ run: index + 1, reason: 'Контейнер запуска исчез из DOM.' }); continue; }
+      const header = container.querySelector('.al-bundle-history-table__row_type_event-head');
+      const arrow = header?.querySelector('.al-bundle-history-event-step-counter__arrow');
+      const date = normalizeText(header?.querySelector('.al-bundle-history-table__cell-event-date')?.textContent || '', 80);
+      const status = redact(header?.querySelector('.al-bundle-history-table__cell_type_status')?.innerText || '', 'journal-status', 100);
+      const record = { index: index + 1, date_time: date || null, status: status || null, expanded: false, steps: [] };
+      records.push(record);
+      if (!header || !arrow || !isVisible(arrow)) {
+        skipped.push({ run: index + 1, reason: 'Заголовок или стрелка запуска не распознаны.' });
+        continue;
+      }
+      const initiallyExpanded = journalEventExpanded(container);
+      if (!initiallyExpanded) {
+        // The arrow is a span; the parent event-head row is its scoped disclosure control.
+        header.click();
+        if (!await waitForJournalState(() => journalEventExpanded(container))) {
+          skipped.push({ run: index + 1, reason: 'Раскрытие записи не подтверждено по классам и видимости списка шагов.' });
+          continue;
+        }
+      }
+      record.expanded = true;
+      const list = container.querySelector('.al-bundle-history-table__step-list');
+      const stepContainers = Array.from(list?.querySelectorAll('.al-bundle-history-table__step-container') || []).filter(isVisible);
+      if (!stepContainers.length) skipped.push({ run: index + 1, reason: 'Раскрытая запись не содержит видимых шагов.' });
+      const stepLimit = Math.min(stepContainers.length, 30);
+      if (stepContainers.length > stepLimit) skipped.push({ run: index + 1, reason: `Шаги ограничены: ${stepLimit} из ${stepContainers.length}.` });
+      for (let stepIndex = 0; stepIndex < stepLimit; stepIndex += 1) {
+        const scope = stepContainers[stepIndex];
+        const buttons = Array.from(scope.querySelectorAll('button.al-bundle-history-table__details-button'))
+          .filter(node => isVisible(node) && /^Детали$/i.test(normalizeText(node.innerText || node.textContent, 40)));
+        const step = { index: stepIndex + 1,
+          summary: redact(scope.querySelector('.al-bundle-history-table__row')?.innerText || scope.innerText || '', 'journal-step', 700),
+          details_opened: false };
+        record.steps.push(step);
+        if (buttons.length !== 1) {
+          skipped.push({ run: index + 1, step: stepIndex + 1, reason: `Ожидалась одна видимая кнопка «Детали», найдено ${buttons.length}.` });
+          continue;
+        }
+        if (journalDetailsPanel()) {
+          skipped.push({ run: index + 1, step: stepIndex + 1, reason: 'Предыдущее окно «Детали» осталось открытым.' });
+          blocked = true;
+          break;
+        }
+        activateElement(buttons[0]);
+        if (!await waitForJournalState(() => Boolean(journalDetailsPanel()))) {
+          skipped.push({ run: index + 1, step: stepIndex + 1, reason: 'Окно «Детали» не открылось.' });
+          continue;
+        }
+        const settled = await settledJournalDetails(previousDetailsText, step.summary);
+        const raw = settled?.text || '';
+        if (raw) previousDetailsText = raw;
+        const isDelay = /Задержка связки|Пауза\s+02/.test(step.summary);
+        const isEmail = /Отправить HTML-письмо|Письмо отправлено/.test(step.summary);
+        const isFilter = /Фильтр\s+04|Фильтр пройден/.test(step.summary);
+        const isUpdate = /Записать дату отправки|Обновлена существующая строка/.test(step.summary);
+        const isSheet = /GS\s+0[13]|Получена новая строка|Искомое значение/.test(step.summary);
+        const related = Boolean(raw) && (
+          isDelay ? /Задержка связки \(в минутах\)/.test(raw) :
+          isEmail ? /Тема письма|Текст письма|SMTP/.test(raw) :
+          isFilter ? ((/Фильтр|Условие/.test(raw) ||
+            (/Нет новых данных/i.test(raw) && /Токен запроса\s*:?\s*\S+/i.test(raw))) &&
+            !/Файл таблицы|Текст письма|Номер строки|SMTP/i.test(raw)) :
+          isUpdate ? /Дата отправки ответа|Обновлена существующая строка/.test(raw) :
+          isSheet ? /Файл таблицы|Лист таблицы|Номер строки/.test(raw) : false);
+        step.details_opened = Boolean(journalDetailsPanel());
+        step.details_verified = related;
+        if (!related) skipped.push({ run: index + 1, step: stepIndex + 1,
+          reason: raw ? 'Содержимое окна не подтверждает принадлежность этому шагу (или совпало с предыдущим).' : 'Окно не дало нового устойчивого содержимого.' });
+        step.details = { text: related ? redact(raw, 'journal-details', 12000) : '[unverified]' };
+        step.truncated = related && raw.length > 12000;
+        if (step.truncated) skipped.push({ run: index + 1, step: stepIndex + 1, reason: 'Содержимое окна «Детали» усечено до 12000 символов.' });
+        if (!await closeJournalDetails()) {
+          skipped.push({ run: index + 1, step: stepIndex + 1, reason: 'Не удалось безопасно закрыть окно «Детали»; обход остановлен.' });
+          blocked = true;
+          break;
+        }
+      }
+      if (!initiallyExpanded && !blocked && header.isConnected) {
+        header.click();
+        if (!await waitForJournalState(() => !journalEventExpanded(container))) {
+          skipped.push({ run: index + 1, reason: 'Не удалось восстановить свёрнутое состояние записи.' });
+          blocked = true;
+        }
+      }
+    }
+    if (total > limit) skipped.push({ reason: `Лимит запусков: обработано не более ${limit} из ${total}.` });
+    audit.evidence.journal_details = records;
+    audit.evidence.journal_details_skipped = skipped;
+    audit.ui.journal_details_read = records.reduce((sum, run) => sum + run.steps.filter(step => step.details_verified).length, 0);
+    audit.summary = { journal_runs_seen: total, journal_runs_expanded: records.filter(run => run.expanded).length,
+      journal_details_read: audit.ui.journal_details_read, journal_details_skipped: skipped.length,
+      journal_details_complete: !blocked && skipped.length === 0 && records.length === total &&
+        records.every(run => run.expanded && run.steps.length > 0 && run.steps.every(step => step.details_verified && !step.truncated)) };
+    audit.limits.push('Обход ограничен текущими DOM-контейнерами загруженной страницы; пропуски и усечение перечислены отдельно.');
+    return audit;
+  }
+
   function collectTestAndDataEvidence(visibleText, dialogs, buttons, controls) {
     const sources = [
       visibleText || '',
@@ -997,17 +1287,18 @@
     };
   }
 
-  function assessReadability(activeView, visibleText, tables, dialogs) {
+  function assessReadability(activeView, visibleText, tables, dialogs, journalRows = []) {
     const text = String(visibleText || '');
     if (activeView === 'journal') {
       if (document.visibilityState === 'hidden') {
         return { status: 'not_readable', reason: 'Страница журнала снята в hidden-вкладке; пустой или неполный результат нельзя считать подтверждением.' };
       }
-      const journalMarkers = /(нет\s+(?:запусков|выполнений)|запуск(?:ов|и|а)?\s*[:#]?\s*\d+|выполнени[ея]|execution|history\s+(?:of|log)|ошиб(?:ка|ки|ок)\s*[:#]?|успешн(?:о|ых)|success(?:ful)?|error\s*[:#]?)/i.test(text);
-      if (tables.length || (journalMarkers && text.length >= 250)) {
-        return { status: 'readable', reason: 'Найдены строки/таблица или характерные элементы журнала.' };
+      const hasHeader = /дата\s*\/\s*время.*сервис.*результат.*статус/i.test(text);
+      const emptyJournal = hasHeader && /(?:нет\s+(?:данных|запусков|выполнений)|no\s+(?:data|runs|executions))/i.test(text.slice(text.search(/дата\s*\/\s*время/i)));
+      if (journalRows.length || emptyJournal) {
+        return { status: 'readable', reason: journalRows.length ? `Подтверждены записи журнала: ${journalRows.length} (только видимая часть страницы).` : 'Журнал явно сообщает об отсутствии записей.' };
       }
-      return { status: 'not_confirmed', reason: 'Не найдены строки, таблица или достаточные признаки журнала.' };
+      return { status: 'not_confirmed', reason: hasHeader ? 'Заголовок журнала виден, но структурированные записи или явное сообщение о пустом журнале не найдены.' : 'Разметка журнала не подтверждена.' };
     }
     if (text.length >= 250 || dialogs.length || tables.length) {
       return { status: 'readable', reason: 'Страница содержит доступный текст или детали модуля.' };
@@ -1026,9 +1317,12 @@
     const steps = collectStepCards(buttons);
     const tables = collectTables();
     const dialogs = collectDialogs();
+    const journalRows = collectJournalRows(activeView, visibleText);
     const saveIndicators = collectSaveIndicators(buttons, visibleText);
-    const testAndData = collectTestAndDataEvidence(visibleText, dialogs, buttons, controls);
-    const readability = assessReadability(activeView, visibleText, tables, dialogs);
+    const testAndData = activeView === 'journal'
+      ? { testing: { status: 'not_applicable', evidence: [] }, operational_data: { status: 'not_applicable', evidence: [] }, settings: { status: 'not_applicable', save_control_visible: false } }
+      : collectTestAndDataEvidence(visibleText, dialogs, buttons, controls);
+    const readability = assessReadability(activeView, visibleText, tables, dialogs, journalRows);
     const audit = {
       schema: 'albato-audit/v1',
       capture_mode: mode,
@@ -1056,6 +1350,7 @@
         steps: steps.length,
         tables: tables.length,
         dialogs: dialogs.length,
+        journal_rows: journalRows.length,
         visible_text_chars: visibleText.length
       },
       evidence: {
@@ -1065,6 +1360,7 @@
         controls,
         tables,
         dialogs,
+        journal_rows: journalRows,
         buttons,
         errors,
         save_indicators: saveIndicators,
@@ -1115,9 +1411,16 @@
         .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
       return true;
     }
+    if (message?.type === 'DIAGNOSE_JOURNAL_DOM') {
+      try { sendResponse({ ok: true, audit: diagnoseJournalDom() }); }
+      catch (error) { sendResponse({ ok: false, error: error?.message || String(error) }); }
+      return true;
+    }
     if (message?.type === 'CAPTURE_AUDIT') {
       try {
-        sendResponse({ ok: true, audit: capture(message.mode || 'screen') });
+        const operation = message.mode === 'journal' ? captureJournalDeep() : Promise.resolve(capture(message.mode || 'screen'));
+        operation.then(audit => sendResponse({ ok: true, audit }))
+          .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
       } catch (error) {
         sendResponse({ ok: false, error: error?.message || String(error) });
       }
