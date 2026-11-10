@@ -1,0 +1,11 @@
+{
+  "name": "albato-inspector-mvp",
+  "private": true,
+  "version": "0.4.40",
+  "scripts": {
+    "test": "node tests/journal-regression.js && node tests/constructor-inspection.js && node tests/module-title-opening.js && node tests/fit-view.js"
+  },
+  "devDependencies": {
+    "jsdom": "29.1.1"
+  }
+}

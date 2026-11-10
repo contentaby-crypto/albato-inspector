@@ -186,7 +186,7 @@
   function collectStepElements() {
     return Array.from(document.querySelectorAll('button, [role="button"]'))
       .filter(isVisible)
-      .filter(element => /^\d+\.\s*/.test(normalizeText(element.innerText || element.textContent, 1200)))
+      .filter(element => /^(?:Подсказка\s*)?\d+\.\s*/.test(normalizeText(element.innerText || element.textContent, 1200)))
       .filter(element => !isDangerousAction(element));
   }
 
@@ -197,7 +197,7 @@
 
   function stepElementData(element) {
     const raw = normalizeText(element.innerText || element.textContent || '', 1200);
-    const header = raw.split(/Connection to/i)[0].trim();
+    const header = raw.replace(/^Подсказка\s*/i, '').split(/Connection to/i)[0].trim();
     const match = header.match(/^(\d+)\.\s*([^:]+):\s*(.*)$/);
     return {
       number: match ? Number(match[1]) : null,
@@ -217,8 +217,38 @@
 
   function findModuleTitleElement(stepElement, plannedStep = null) {
     const cardRect = stepElement.getBoundingClientRect();
-    const scope = stepElement.parentElement || document.body;
+    const scope = stepElement.closest('.react-flow__node') || stepElement;
     const titlePattern = /(?:\bGS|\bEmail|\bПауза|\bФильтр)\s*\d+\s*[—–-]/i;
+    // Albato's custom scenario labels (e.g. AV-MACRO 12.1) do not match
+    // the legacy GS/Email pattern. Locate their actual text node first.
+    const customMarker = String(plannedStep?.operation || '').match(/\b[A-ZА-Я]{2,}(?:[-_][A-ZА-Я]{2,})?\s*\d+(?:\.\d+)?\s*\|/i)?.[0];
+    const markers = customMarker ? [customMarker] : [];
+    if (!markers.length && /ветвление/i.test(plannedStep?.operation || '')) markers.push('Ветвление');
+    if (!markers.length) {
+      const operationName = String(plannedStep?.operation || '').split(/\b[A-ZА-Я]{2,}(?:[-_][A-ZА-Я]{2,})?\s*\d+(?:\.\d+)?\s*\|/i)[0].trim();
+      if (operationName.length >= 8) markers.push(operationName);
+    }
+    for (const marker of markers) {
+      const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const raw = String(node.nodeValue || '');
+        const index = raw.toLowerCase().indexOf(marker.toLowerCase());
+        if (index < 0 || !node.parentElement || !isVisible(node.parentElement)) continue;
+        const unsafe = node.parentElement.closest('button, [role="button"], [class*="kebab"], [class*="toolbar"], [class*="connection"]');
+        if (unsafe && unsafe !== stepElement && !unsafe.contains(stepElement)) continue;
+        const range = document.createRange();
+        range.setStart(node, index);
+        range.setEnd(node, Math.min(raw.length, index + marker.length));
+        const rect = range.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0 || rect.left < cardRect.left - 8 || rect.right > cardRect.right + 8 ||
+            rect.top < cardRect.top - 8 || rect.bottom > cardRect.top + cardRect.height * 0.78) continue;
+        node.parentElement.__albatoClickRange = { node, start: index, end: Math.min(raw.length, index + marker.length) };
+        node.parentElement.__albatoClickRect = rect;
+        node.parentElement.__albatoClickText = marker;
+        return node.parentElement;
+      }
+    }
     const plannedMarker = String(plannedStep?.raw || '').match(titlePattern)?.[0] || '';
     const candidates = [stepElement, ...Array.from(scope.querySelectorAll('*'))]
       .filter(element => element !== stepElement && isVisible(element))
@@ -279,12 +309,18 @@
       }
       node = walker.nextNode();
     }
-    // Final fallback for React Flow nodes without a separate title element.
-    // The safe target is the upper-middle title band, away from the three-dot menu and connection selector.
-    stepElement.__albatoClickBand = { left: 0.68, top: 0.28, width: 0.16, height: 0.18 };
-    delete stepElement.__albatoClickRect;
-    stepElement.__albatoClickText = 'module-title-band-fallback';
-    return stepElement;
+    const titleTextCandidates = Array.from(scope.querySelectorAll('.al-typography.truncate.text-textPrimary'))
+      .filter(isVisible)
+      .filter(element => /al-typography_mod_semibold/.test(String(element.className || '')))
+      .filter(element => {
+        const r = element.getBoundingClientRect();
+        return r.left >= cardRect.left - 8 && r.right <= cardRect.right + 8 &&
+          r.top >= cardRect.top - 8 && r.bottom <= cardRect.bottom + 8 &&
+          !/^(?:connection to|подключени|добавить ветку)$/i.test(normalizeText(element.innerText || element.textContent, 100));
+      });
+    if (titleTextCandidates.length === 1) return titleTextCandidates[0];
+    // No broad title-band click: it can hit the navigation bar or another node.
+    return null;
   }
 
   function elementDescriptor(element) {
@@ -353,7 +389,7 @@
     const expectedMarkers = operation.includes('создана новая строка') ? ['создана новая строка', 'новая строка']
       : operation.includes('задержка') || operation.includes('пауза') ? ['задержка', 'пауза']
       : operation.includes('найти одну строку') ? ['найти одну строку']
-      : operation.includes('фильтр') || operation.includes('условию') ? ['задать поведение связки', 'условие']
+      : (operation.includes('условию') || (expectedStep?.app === 'Инструмент' && operation.startsWith('фильтр'))) ? ['задать поведение связки', 'условие']
       : operation.includes('отправка письма') || operation.includes('smtp') ? ['отправка письма', 'smtp', 'электронная почта']
       : operation.includes('обновить строку') || operation.includes('дата отправки') ? ['обновить строку', 'дата отправки']
       : [];
@@ -474,6 +510,83 @@
       } catch (_) { /* fallback to click below */ }
     }
     try { dispatchTarget.click(); } catch (_) { element.click(); }
+  }
+
+  function activateModuleTitle(target, stepElement) {
+    if (!target) return false;
+    try { stepElement.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) { /* optional */ }
+    if (target.__albatoClickRange) {
+      const { node, start, end } = target.__albatoClickRange;
+      if (!node.isConnected) return false;
+      const range = document.createRange();
+      range.setStart(node, start);
+      range.setEnd(node, end);
+      target.__albatoClickRect = range.getBoundingClientRect();
+    }
+    const rect = target.__albatoClickRect || target.getBoundingClientRect();
+    const card = stepElement.closest('.react-flow__node') || stepElement;
+    const cardRect = card.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    if (rect.width <= 0 || rect.height <= 0 || x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight ||
+        x < cardRect.left || x > cardRect.right || y < cardRect.top || y > cardRect.bottom) return false;
+    const hit = document.elementFromPoint(x, y);
+    target.__albatoHitTarget = hit;
+    if (!hit || !card.contains(hit) || hit.closest('[class*="kebab"], [class*="toolbar"], [class*="connection"], [class*="bgConditionNode"]')) return false;
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
+      hit.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+    }
+    hit.click();
+    return true;
+  }
+
+  async function revealModuleTitle(stepElement, plannedStep) {
+    let target = findModuleTitleElement(stepElement, plannedStep);
+    const card = stepElement.closest('.react-flow__node') || stepElement;
+    const rect = (target || card).getBoundingClientRect();
+    const offscreen = rect.right <= 0 || rect.left >= window.innerWidth || rect.bottom <= 0 || rect.top >= window.innerHeight;
+    if (!offscreen) return { target, fit_view_attempted: false };
+    // React Flow uses a transformed canvas: scrollIntoView cannot bring a
+    // node with negative viewport coordinates into the viewport. The built-in
+    // Fit View control changes only the editor's view, not scenario settings.
+    const controls = Array.from(document.querySelectorAll('button.react-flow__controls-fitview'))
+      .filter(isVisible).filter(button => !button.disabled);
+    if (controls.length !== 1) return { target, fit_view_attempted: false, reason: 'Fit View control not uniquely available.' };
+    const before = card.getBoundingClientRect();
+    activateElement(controls[0]);
+    await delay(450);
+    const after = card.getBoundingClientRect();
+    if (Math.abs(after.left - before.left) < 4 && Math.abs(after.top - before.top) < 4) {
+      return { target, fit_view_attempted: true, reason: 'Fit View did not move the target card.' };
+    }
+    const freshStep = findStepElement(plannedStep.number, plannedStep.raw);
+    if (!freshStep) return { target: null, fit_view_attempted: true, reason: 'Card disappeared after Fit View.' };
+    stepElement = freshStep;
+    target = findModuleTitleElement(freshStep, plannedStep);
+    return { target, stepElement: freshStep, fit_view_attempted: true };
+  }
+
+  function moduleTitleProbe(stepElement, target) {
+    const card = stepElement.closest('.react-flow__node') || stepElement;
+    const rect = card.getBoundingClientRect();
+    const box = r => ({ x: Math.round(r.left), y: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) });
+    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+    const titleNodes = [];
+    let node;
+    while ((node = walker.nextNode()) && titleNodes.length < 16) {
+      const text = normalizeText(node.nodeValue, 100);
+      if (!text || !node.parentElement || !isVisible(node.parentElement)) continue;
+      titleNodes.push({ text: redact(text, 'title probe', 100), class_name: normalizeText(String(node.parentElement.className || ''), 100), box: box(node.parentElement.getBoundingClientRect()) });
+    }
+    const targetRect = target?.__albatoClickRect || target?.getBoundingClientRect();
+    const x = targetRect ? targetRect.left + targetRect.width / 2 : null;
+    const y = targetRect ? targetRect.top + targetRect.height / 2 : null;
+    const hit = x !== null && x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight ? document.elementFromPoint(x, y) : null;
+    return { card: box(rect), viewport: { width: window.innerWidth, height: window.innerHeight },
+      target: targetRect ? box(targetRect) : null, hit: hit ? {
+        inside_card: card.contains(hit), tag: hit.tagName.toLowerCase(), class_name: normalizeText(String(hit.className || ''), 120),
+        text: redact(hit.innerText || hit.textContent || '', 'hit target', 100)
+      } : null, title_nodes: titleNodes };
   }
 
   function summarizeScenarioStep(step) {
@@ -705,7 +818,7 @@
     };
   }
 
-  async function scanModuleOneAreas(stepElement, plannedStep) {
+  async function scanModuleOneAreas(stepElement, plannedStep, includeFilter = true) {
     const result = { requested: plannedStep.number === 1, records: [], skipped: [] };
     if (!result.requested) return result;
     await closeAllSafePanels();
@@ -713,7 +826,7 @@
     result.diagnostics = collectRelatedAreaDiagnostics(freshStepElement);
     for (const area of [
       { kind: 'connection-extra-settings', label: 'Дополнительные настройки подключения' },
-      { kind: 'filter', label: 'Фильтр' }
+      ...(includeFilter ? [{ kind: 'filter', label: 'Фильтр' }] : [])
     ]) {
       const currentStepElement = findStepElement(plannedStep.number, plannedStep.raw) || freshStepElement;
       const target = findModuleRelatedTarget(currentStepElement, area.kind === 'filter' ? 'filter' : 'connection-extra');
@@ -740,6 +853,212 @@
       });
       await closeAllSafePanels();
     }
+    return result;
+  }
+
+  // Filters are separate React Flow nodes: the webhook and every branch can
+  // have one. Do not associate a chip with the nearest module by guesswork.
+  function constructorFilterTargets() {
+    const chips = Array.from(document.querySelectorAll('[class*="bgConditionNode"]'))
+      .filter(isVisible)
+      .filter(element => normalizeText(element.innerText || element.textContent, 80) === 'Фильтр')
+      .filter(element => !Array.from(element.children).some(child =>
+        isVisible(child) && normalizeText(child.innerText || child.textContent, 80) === 'Фильтр' &&
+        String(child.className || '').includes('bgConditionNode')));
+    const branchButtons = Array.from(document.querySelectorAll('button, [role="button"]'))
+      .filter(isVisible)
+      .filter(element => /Фильтр\s*(?:вкл|выкл)\./i.test(normalizeText(element.innerText || element.textContent, 300)))
+      .filter(element => !/^\s*(?:Подсказка\s*)?\d+\./i.test(normalizeText(element.innerText || element.textContent, 300)))
+      .filter(element => !Array.from(element.querySelectorAll('button, [role="button"]')).some(child =>
+        isVisible(child) && /Фильтр\s*(?:вкл|выкл)\./i.test(normalizeText(child.innerText || child.textContent, 300))));
+    return [...chips.map(element => ({ element, kind: 'webhook-or-module' })),
+      ...branchButtons.map(element => ({ element, kind: 'branch' }))].slice(0, 60).map(({ element, kind }, index) => {
+      const node = element.closest('[data-id], [data-node-id], .react-flow__node');
+      const rect = element.getBoundingClientRect();
+      const label = normalizeText(element.innerText || element.textContent, 260);
+      return {
+        element,
+        kind,
+        branch_name: kind === 'branch' ? redact(label.replace(/Фильтр\s*(?:вкл|выкл)\..*$/i, ''), 'branch name', 160) : null,
+        filter_enabled: kind === 'branch' ? /Фильтр\s*вкл\./i.test(label) : null,
+        index: index + 1,
+        node_id: node?.getAttribute('data-id') || node?.getAttribute('data-node-id') || null,
+        node_label: redact(node?.innerText || node?.textContent || '', 'filter node', 180),
+        position: { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) }
+      };
+    });
+  }
+
+  function branchTitleTarget(branch) {
+    const title = branch.branch_name;
+    if (!title) return null;
+    const candidates = Array.from(branch.element.querySelectorAll('span, div, p, strong'))
+      .filter(isVisible)
+      .filter(element => normalizeText(element.innerText || element.textContent, 180) === title)
+      .sort((a, b) => a.getBoundingClientRect().width * a.getBoundingClientRect().height -
+        b.getBoundingClientRect().width * b.getBoundingClientRect().height);
+    return candidates[0] || null;
+  }
+
+  async function scanConstructorFilters() {
+    const planned = constructorFilterTargets().map(({ index, kind, branch_name, filter_enabled, node_id, node_label, position }) =>
+      ({ index, kind, branch_name, filter_enabled, node_id, node_label, position }));
+    const records = [];
+    const skipped = [];
+    for (const plan of planned) {
+      await closeAllSafePanels();
+      if (collectDialogs().length) {
+        skipped.push({ filter: plan, reason: 'Предыдущая панель не закрылась; обход фильтров остановлен.' });
+        break;
+      }
+      const candidates = constructorFilterTargets().filter(item =>
+        item.kind === plan.kind && (plan.node_id ? item.node_id === plan.node_id : item.index === plan.index) &&
+        (plan.kind !== 'branch' || item.branch_name === plan.branch_name));
+      const fresh = candidates.length === 1 ? candidates[0] : null;
+      if (!fresh) {
+        skipped.push({ filter: plan, reason: 'Фильтр не удалось однозначно найти повторно.' });
+        continue;
+      }
+      const target = fresh.kind === 'branch' ? branchTitleTarget(fresh) : fresh.element;
+      if (!target) {
+        skipped.push({ filter: plan, reason: 'Заголовок ветки не найден отдельно от переключателя фильтра; клик пропущен.',
+          title_candidates: Array.from(fresh.element.querySelectorAll('span, div')).filter(isVisible).slice(0, 12).map(element => ({
+            text: redact(element.innerText || element.textContent || '', 'branch title', 120),
+            class_name: normalizeText(String(element.className || ''), 120)
+          })) });
+        continue;
+      }
+      const before = pageFingerprint();
+      activateElement(target);
+      const changed = await waitForUiChange(before);
+      const snapshot = capture('filter');
+      const dialogs = snapshot.evidence?.dialogs || [];
+      const confirmed = changed && dialogs.some(dialog => /фильтр|услови|поведени/i.test(dialog.text || ''));
+      if (confirmed) records.push({ filter: plan, opened: true,
+        controls: snapshot.evidence?.controls || [], dialogs,
+        visible_text: snapshot.evidence?.visible_text || '' });
+      else skipped.push({ filter: plan, reason: 'Настройки фильтра не подтверждены после открытия.' });
+      await closeAllSafePanels();
+      if (collectDialogs().length) break;
+    }
+    for (const plan of planned) {
+      if (records.some(record => record.filter.index === plan.index) || skipped.some(item => item.filter.index === plan.index)) continue;
+      skipped.push({ filter: plan, reason: 'Обход остановлен до чтения этого фильтра.' });
+    }
+    return { planned: planned.length, records, skipped,
+      limits: ['Привязка к ветке подтверждается только при наличии ID/подписи узла; позиция на схеме не доказывает принадлежность ветке.'] };
+  }
+
+  function exactErrorHandlerMenuItem() {
+    const scopes = Array.from(document.querySelectorAll('[role="menu"], [class*="dropdown"], [class*="popover"], [class*="menu"]'))
+      .filter(isVisible);
+    const candidates = scopes.flatMap(scope => Array.from(scope.querySelectorAll('[role="menuitem"], button, [role="button"], [class*="item"]')))
+      .filter(isVisible)
+      .filter(element => normalizeText(element.innerText || element.textContent, 100) === 'Обработчик ошибок');
+    return [...new Set(candidates)].length === 1 ? candidates[0] : null;
+  }
+
+  function verifiedSelectedHandler(dialog) {
+    if (!dialog) return null;
+    const scopes = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], .al-modal__content'))
+      .filter(isVisible).filter(element => /Обработчик ошибок/i.test(element.innerText || ''));
+    const selected = scopes.flatMap(scope => Array.from(scope.querySelectorAll('input:checked, option:checked, [aria-checked="true"], [aria-selected="true"]')))
+      .filter(element => isVisible(element) || isVisible(element.closest('label, [role="radio"], [role="option"], [role="menuitemradio"]')))
+      .map(element => {
+        const label = element.closest('label, [role="radio"], [role="option"], [role="menuitemradio"]');
+        return redact(label?.innerText || elementLabel(element) || element.value || '', 'error handler choice', 200);
+      }).filter(Boolean);
+    return [...new Set(selected)].length === 1 ? selected[0] : null;
+  }
+
+  function errorHandlerChoiceDiagnostics() {
+    const choices = [
+      'Остановить связку при ошибке',
+      'Игнорировать ошибки на этом шаге, продолжить работу связки.',
+      'При ошибке перейти к выбранному шагу'
+    ];
+    const panel = Array.from(document.querySelectorAll('.al-modal__content, [role="dialog"], [aria-modal="true"]'))
+      .filter(isVisible)
+      .filter(element => /Обработчик ошибок/i.test(element.innerText || ''))
+      .find(element => choices.every(choice => (element.innerText || '').includes(choice)));
+    if (!panel) return [];
+    return choices.map(choice => {
+      const exact = Array.from(panel.querySelectorAll('span, label, div, p'))
+        .filter(isVisible)
+        .filter(element => normalizeText(element.innerText || element.textContent, 260) === choice)
+        .sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length)[0];
+      const ancestors = [];
+      for (let node = exact, depth = 0; node && node !== panel && depth < 5; node = node.parentElement, depth += 1) {
+        ancestors.push({
+          tag: node.tagName.toLowerCase(),
+          class_name: normalizeText(String(node.className || ''), 180),
+          role: node.getAttribute('role') || null,
+          aria_checked: node.getAttribute('aria-checked'),
+          aria_selected: node.getAttribute('aria-selected'),
+          data_state: node.getAttribute('data-state'),
+          checked: node.matches('input') ? node.checked : null
+        });
+      }
+      return { choice, found: Boolean(exact), ancestors };
+    });
+  }
+
+  async function scanModuleErrorHandler(plannedStep) {
+    if (collectDialogs().length) return { status: 'not_confirmed', reason: 'Предыдущая панель не закрылась.' };
+    const step = findStepElement(plannedStep.number, plannedStep.raw);
+    if (!step) return { status: 'not_confirmed', reason: 'Карточка модуля не найдена.' };
+    // Only an explicitly marked menu control is safe; never use an anonymous
+    // button or right-click on the entire React Flow node.
+    const rect = step.getBoundingClientRect();
+    const node = step.closest('[data-id], [data-node-id], .react-flow__node');
+    const explicitButtons = node ? Array.from(node.querySelectorAll('button.al-kebab-menu__button.wl-kebab-menu-button')).filter(isVisible) : [];
+    const menuButtons = explicitButtons.length ? explicitButtons : Array.from(document.querySelectorAll('button.al-kebab-menu__button.wl-kebab-menu-button, button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"], button[aria-label], button[title]'))
+      .filter(isVisible).filter(button => {
+        const r = button.getBoundingClientRect();
+        const name = `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''}`;
+        return r.left >= rect.left + rect.width * 0.65 && r.right <= rect.right + 8 &&
+          r.top >= rect.top - 8 && r.bottom <= rect.top + rect.height * 0.55 &&
+          r.width <= 48 && r.height <= 48 &&
+          (button.matches('button.al-kebab-menu__button.wl-kebab-menu-button') || button.getAttribute('aria-haspopup') === 'menu' || /^(?:more|options|menu|действия|меню|ещё|еще|⋮|…)[\s.]*$/i.test(name.trim()));
+      });
+    if (menuButtons.length !== 1) {
+      const candidates = Array.from(document.querySelectorAll('button, [role="button"], [class*="menu"], [class*="more"]'))
+        .filter(isVisible).filter(element => {
+          const r = element.getBoundingClientRect();
+          return r.left >= rect.left - 8 && r.right <= rect.right + 8 && r.top >= rect.top - 8 && r.bottom <= rect.bottom + 8 && r.width <= 48 && r.height <= 48;
+        }).slice(0, 12).map(element => ({
+          tag: element.tagName.toLowerCase(),
+          class_name: normalizeText(String(element.className || ''), 160),
+          label: redact(`${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`, 'menu label', 100)
+        }));
+      return { status: 'not_confirmed', reason: `Однозначная кнопка меню не найдена (${menuButtons.length}).`, menu_candidates: candidates };
+    }
+    const before = pageFingerprint();
+    activateElement(menuButtons[0]);
+    if (!await waitForUiChange(before)) return { status: 'not_confirmed', reason: 'Контекстное меню не открылось.' };
+    const item = exactErrorHandlerMenuItem();
+    if (!item) {
+      await closeAllSafePanels();
+      return { status: 'not_confirmed', reason: 'Пункт «Обработчик ошибок» не найден однозначно.' };
+    }
+    const menuBefore = pageFingerprint();
+    activateElement(item);
+    const changed = await waitForUiChange(menuBefore);
+    const snapshot = capture('error-handler');
+    const dialogs = (snapshot.evidence?.dialogs || []).filter(dialog => /Обработчик ошибок/i.test(dialog.text || ''));
+    const panel = dialogs.find(dialog => /Выберите действие при возникновении ошибок/i.test(dialog.text || ''));
+    const selected = changed && panel ? verifiedSelectedHandler(panel) : null;
+    const result = {
+      status: selected ? 'confirmed' : 'not_confirmed',
+      panel_opened: Boolean(changed && panel),
+      selected: selected || null,
+      reason: selected ? null : (panel ? 'Панель открыта, но выбранный вариант не имеет подтверждённого DOM-признака.' : 'Панель обработчика не подтверждена.'),
+      choice_diagnostics: panel ? errorHandlerChoiceDiagnostics() : [],
+      dialogs,
+      controls: snapshot.evidence?.controls || [],
+      visible_text: snapshot.evidence?.visible_text || ''
+    };
+    await closeAllSafePanels();
     return result;
   }
 
@@ -774,17 +1093,22 @@
         module_detection: { detail_kind: 'not-found', reason: 'Карточка шага не найдена после обновления DOM.' }
       };
     }
-    const titleTarget = findModuleTitleElement(element, plannedStep);
+    const revealed = await revealModuleTitle(element, plannedStep);
+    const titleTarget = revealed.target;
+    const currentElement = revealed.stepElement || element;
     const before = pageFingerprint();
-    activateElement(titleTarget);
-    const changed = await waitForUiChange(before);
-    await delay(350);
+    const clicked = activateModuleTitle(titleTarget, currentElement);
+    const changed = clicked ? await waitForUiChange(before) : false;
+    if (clicked) await delay(350);
     const snapshot = capture('module-debug');
-    const detection = moduleEvidence(overview, snapshot, changed, plannedStep);
+    const detection = clicked ? moduleEvidence(overview, snapshot, changed, plannedStep)
+      : { opened: false, module_settings_opened: false, detail_kind: 'unsafe-title-target', reason: 'Заголовок не найден или точка клика вне карточки/перекрыта.', title_probe: moduleTitleProbe(element, titleTarget) };
     const test = runTest
       ? (detection.module_settings_opened ? await runModuleTest(plannedStep) : { requested: true, status: 'not_available', evidence: { reason: 'Настройки модуля не открылись, тест не запускался.' } })
       : { requested: false, status: 'not_requested' };
     const subSettings = await scanModuleOneAreas(element, plannedStep);
+    await closeAllSafePanels();
+    const errorHandler = await scanModuleErrorHandler(plannedStep);
     const result = {
       schema: 'albato-module-audit/v1',
       capture_mode: 'module-debug',
@@ -800,6 +1124,7 @@
       module_detection: detection,
       test,
       sub_settings: subSettings,
+      error_handler: errorHandler,
       settings: {
         controls: snapshot.evidence?.controls || [],
         dialogs: snapshot.evidence?.dialogs || [],
@@ -835,29 +1160,40 @@
         skipped.push({ step: plannedStep, reason: 'Карточка шага не найдена после обновления DOM.' });
         continue;
       }
-      const titleTarget = findModuleTitleElement(element, plannedStep);
+      const revealed = await revealModuleTitle(element, plannedStep);
+      const titleTarget = revealed.target;
+      const currentElement = revealed.stepElement || element;
       reportProgress(`Открываю шаг ${plannedStep.number}: ${plannedStep.app || plannedStep.operation}`);
       const baseline = overview;
-      let before = pageFingerprint();
-      activateElement(titleTarget);
-      let changed = await waitForUiChange(before);
-      await delay(350);
-      let snapshot = capture('module');
-      let detection = moduleEvidence(baseline, snapshot, changed, plannedStep);
+      const before = pageFingerprint();
+      const clicked = activateModuleTitle(titleTarget, currentElement);
+      const changed = clicked ? await waitForUiChange(before) : false;
+      if (clicked) await delay(350);
+      const snapshot = capture('module');
+      const detection = clicked ? moduleEvidence(baseline, snapshot, changed, plannedStep)
+        : { opened: false, module_settings_opened: false, detail_kind: 'unsafe-title-target', reason: 'Заголовок не найден или точка клика вне карточки/перекрыта.', title_probe: moduleTitleProbe(element, titleTarget) };
 
       snapshot.step = plannedStep;
       snapshot.click_target = elementDescriptor(titleTarget);
       snapshot.module_opened = detection.opened;
       snapshot.module_settings_opened = detection.module_settings_opened;
       snapshot.module_detection = detection;
-      if (plannedStep.number === 1) snapshot.sub_settings = await scanModuleOneAreas(element, plannedStep);
+      if (plannedStep.number === 1) snapshot.sub_settings = await scanModuleOneAreas(element, plannedStep, false);
       if (!detection.module_settings_opened) {
         skipped.push({ step: plannedStep, reason: detection.reason });
+      }
+      await closeAllSafePanels();
+      snapshot.error_handler = await scanModuleErrorHandler(plannedStep);
+      if (snapshot.error_handler.status !== 'confirmed') {
+        skipped.push({ step: plannedStep, area: 'error_handler', reason: snapshot.error_handler.reason });
       }
       modules.push(snapshot);
       await closeAllSafePanels();
     }
 
+    reportProgress('Считываю фильтры после вебхука и на ветках конструктора.');
+    const filters = await scanConstructorFilters();
+    skipped.push(...filters.skipped.map(item => ({ area: 'filter', ...item })));
     let journal = null;
     if (includeJournal) {
       const href = journalHref();
@@ -890,6 +1226,7 @@
       scenario: overview.scenario,
       overview,
       modules,
+      filters,
       journal,
       summary: {
         planned_steps: stepPlan.length,
@@ -899,6 +1236,14 @@
         configured_modules: modules.filter(module => module.module_detection?.module_settings_opened).length,
         connection_only_modules: modules.filter(module => module.module_detection?.detail_kind === 'connection-settings').length,
         unconfirmed_module_settings: modules.filter(module => !module.module_detection?.module_settings_opened).length,
+        filters_found: filters.planned,
+        filters_read: filters.records.length,
+        filters_unconfirmed: filters.skipped.length,
+        branch_filters_found: filters.records.filter(record => record.filter.kind === 'branch').length + filters.skipped.filter(item => item.filter.kind === 'branch').length,
+        branch_filters_read: filters.records.filter(record => record.filter.kind === 'branch').length,
+        error_handler_panels_opened: modules.filter(module => module.error_handler?.panel_opened).length,
+        error_handlers_confirmed: modules.filter(module => module.error_handler?.status === 'confirmed').length,
+        error_handlers_unconfirmed: modules.filter(module => module.error_handler?.status !== 'confirmed').length,
         skipped_items: skipped.length + (journal?.summary?.journal_details_skipped || 0),
         journal_requested: Boolean(includeJournal),
         journal_captured: Boolean(journal && journal.page?.readability?.status === 'readable'),
@@ -909,7 +1254,7 @@
       },
       skipped,
       limits: [
-        'Расширение нажимает только на карточки шагов и безопасные кнопки закрытия.',
+        'Расширение открывает карточки, явно найденные фильтры и однозначные пункты меню «Обработчик ошибок»; настройки не меняет.',
         'Кнопки сохранения, запуска, тестирования, сброса и удаления заблокированы для обхода.',
         'Наличие значения на экране не является самостоятельным доказательством сохранения.',
         'Если Albato не отдает значение в DOM или доступном журнале, оно отмечается как непроверенное.'
@@ -935,9 +1280,9 @@
 
   function collectStepCards(buttons) {
     return buttons
-      .filter(item => /^\d+\.\s*/.test(item.text))
+      .filter(item => /^(?:Подсказка\s*)?\d+\.\s*/.test(item.text))
       .map(item => {
-        const header = item.text.split(/Connection to/i)[0].trim();
+        const header = item.text.replace(/^Подсказка\s*/i, '').split(/Connection to/i)[0].trim();
         const match = header.match(/^(\d+)\.\s*([^:]+):\s*(.*)$/);
         const connection = item.text.match(/(Connection to .+?)(?=Фильтр|Миграция|$)/i);
         return {
@@ -1249,7 +1594,7 @@
     audit.ui.journal_details_read = records.reduce((sum, run) => sum + run.steps.filter(step => step.details_verified).length, 0);
     audit.summary = { journal_runs_seen: total, journal_runs_expanded: records.filter(run => run.expanded).length,
       journal_details_read: audit.ui.journal_details_read, journal_details_skipped: skipped.length,
-      journal_details_complete: !blocked && skipped.length === 0 && records.length === total &&
+      journal_details_complete: total > 0 && !blocked && skipped.length === 0 && records.length === total &&
         records.every(run => run.expanded && run.steps.length > 0 && run.steps.every(step => step.details_verified && !step.truncated)) };
     audit.limits.push('Обход ограничен текущими DOM-контейнерами загруженной страницы; пропуски и усечение перечислены отдельно.');
     return audit;

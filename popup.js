@@ -10,6 +10,7 @@ const summaryNode = document.querySelector('#summary');
 const moduleListNode = document.querySelector('#module-list');
 const previewNode = document.querySelector('#preview');
 const badgeNode = document.querySelector('#badge');
+document.querySelector('#version').textContent = `Версия ${chrome.runtime.getManifest().version} · albato-audit/v2`;
 
 let latest = null;
 const moduleAudits = new Map();
@@ -202,9 +203,10 @@ function renderAudit(audit) {
   const detailSkipped = journal?.summary?.journal_details_skipped ?? 0;
   const journalStatus = !audit.summary?.journal_requested ? 'журнал не запрошен'
     : !audit.summary?.journal_captured ? 'журнал не подтверждён'
+    : runCount === 0 ? 'журнал: 0 запусков за текущий период; «Детали» не проверялись'
     : `журнал: ${runCount} запусков · Детали: ${detailCount} · ${journal?.summary?.journal_details_complete === true ? 'полностью прочитаны' : `неполно (${detailSkipped} пропусков)`}`;
   summaryNode.textContent = audit.schema === 'albato-audit/v2'
-    ? `${scenario} · полный аудит · открыто: ${captured}/${steps} · настройки: ${configured}/${steps} · ${journalStatus} · пропущено: ${audit.summary?.skipped_items ?? 0}`
+    ? `${scenario} · полный аудит · открыто: ${captured}/${steps} · настройки: ${configured}/${steps} · фильтры: ${audit.summary?.filters_read ?? 0}/${audit.summary?.filters_found ?? 0} (ветки: ${audit.summary?.branch_filters_read ?? 0}/${audit.summary?.branch_filters_found ?? 0}) · обработчики ошибок: открыто ${audit.summary?.error_handler_panels_opened ?? 0}/${steps}, выбор ${audit.summary?.error_handlers_confirmed ?? 0}/${steps} · ${journalStatus} · пропущено: ${audit.summary?.skipped_items ?? 0}`
     : `${scenario} · экран: ${view} · шагов: ${steps} · таблиц: ${tables} · полей: ${controls} · ошибок: ${errors}`;
   badgeNode.textContent = 'снято';
 }
