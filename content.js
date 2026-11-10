@@ -727,44 +727,27 @@
 
   function findModuleRelatedTarget(stepElement, kind) {
     if (kind === 'filter') {
-      const globalFilterCandidates = Array.from(document.querySelectorAll('[class*="bgConditionNode"], [class*="bg-bgConditionNode"], [class*="toolbar"]'))
+      // The trigger's incoming-data filter is part of its numbered card,
+      // not one of the separate React Flow condition nodes. Scope it to
+      // this card before considering any page-wide filter chips.
+      const card = stepElement.closest('.react-flow__node') || stepElement;
+      const triggerToolbar = Array.from(card.querySelectorAll('.al-step-card-wrapper-pro-mode__toolbar .cursor-pointer'))
         .filter(isVisible)
-        .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 120), rect: element.getBoundingClientRect() }))
-        .filter(item => /\bфильтр\b|\bfilter\b/i.test(item.text))
-        .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
-      if (globalFilterCandidates[0]) return globalFilterCandidates[0].element;
+        .filter(element => /^Фильтр\s*(?:вкл|выкл)\.$/i.test(normalizeText(element.innerText || element.textContent, 100)));
+      if (triggerToolbar.length === 1) return triggerToolbar[0];
+      // Do not click an unrelated branch chip as a fallback for the trigger.
+      return null;
     }
     const cardRect = stepElement.getBoundingClientRect();
-    if (kind === 'filter') {
-      const explicitCandidates = Array.from(document.querySelectorAll('.al-step-card-wrapper-pro-mode__toolbar, [class*="bgConditionNode"], [class*="bg-bgConditionNode"], [class*="cursor-pointer"]'))
-        .filter(isVisible)
-        .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 180), rect: element.getBoundingClientRect() }))
-        .filter(item => /\bфильтр\b|\bfilter\b/i.test(item.text))
-        .filter(item => item.rect.left >= cardRect.left - 12 && item.rect.right <= cardRect.right + 12 && item.rect.top >= cardRect.top + cardRect.height * 0.55)
-        .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height) || a.text.length - b.text.length);
-      if (explicitCandidates[0]) return explicitCandidates[0].element;
-      const filterHit = document.elementFromPoint(cardRect.left + cardRect.width * 0.5, cardRect.top + cardRect.height * 1.03);
-      const filterScope = filterHit?.closest?.('[class*="bgConditionNode"], [class*="toolbar"], [class*="filter"]') || filterHit;
-      if (filterScope && isVisible(filterScope) && /фильтр|filter/i.test(normalizeText(filterScope.innerText || filterScope.textContent || '', 120))) return filterScope;
-    } else {
-      const icon = Array.from(document.querySelectorAll('button.al-icon-button, button[class*="al-icon-button"]'))
-        .filter(isVisible)
-        .map(element => ({ element, rect: element.getBoundingClientRect() }))
-        .filter(item => item.rect.left > cardRect.left + cardRect.width * 0.72 && item.rect.top >= cardRect.top + cardRect.height * 0.45 && item.rect.top <= cardRect.bottom + 20)
-        .sort((a, b) => a.rect.left - b.rect.left)[0];
-      if (icon) return icon.element;
-    }
+    const icon = Array.from(document.querySelectorAll('button.al-icon-button, button[class*="al-icon-button"]'))
+      .filter(isVisible)
+      .map(element => ({ element, rect: element.getBoundingClientRect() }))
+      .filter(item => item.rect.left > cardRect.left + cardRect.width * 0.72 && item.rect.top >= cardRect.top + cardRect.height * 0.45 && item.rect.top <= cardRect.bottom + 20)
+      .sort((a, b) => a.rect.left - b.rect.left)[0];
+    if (icon) return icon.element;
     const all = Array.from(document.querySelectorAll('*'))
       .filter(isVisible)
       .filter(element => !isDangerousAction(element));
-    if (kind === 'filter') {
-      const candidates = all
-        .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 180), rect: element.getBoundingClientRect() }))
-        .filter(item => /\bфильтр\b|\bfilter\b/i.test(item.text))
-        .filter(item => item.rect.left >= cardRect.left - 12 && item.rect.right <= cardRect.right + 12 && item.rect.top >= cardRect.top + cardRect.height * 0.55)
-        .sort((a, b) => a.text.length - b.text.length);
-      return candidates[0]?.element || null;
-    }
     const connectionCandidates = all
       .map(element => ({ element, text: normalizeText(element.innerText || element.textContent || '', 180), rect: element.getBoundingClientRect() }))
       .filter(item => /connection to|подключени/i.test(item.text) && item.rect.left >= cardRect.left - 12 && item.rect.right <= cardRect.right + 12)
@@ -839,10 +822,14 @@
       const changed = await waitForUiChange(before);
       await delay(350);
       const snapshot = capture(`module-${area.kind}`);
+      const isFilter = area.kind === 'filter';
+      const filterPanelOpened = isFilter && (snapshot.evidence?.dialogs || []).some(dialog => /Фильтр входящих данных/i.test(dialog.text || ''));
+      const filterFields = filterPanelOpened ? await inspectFilterFields() : null;
       result.records.push({
         kind: area.kind,
         label: area.label,
-        opened: changed || (snapshot.ui?.dialogs || 0) > 0,
+        opened: isFilter ? Boolean(changed && filterPanelOpened) : (changed || (snapshot.ui?.dialogs || 0) > 0),
+        filter_fields: filterFields,
         page: snapshot.page,
         ui: snapshot.ui,
         controls: snapshot.evidence?.controls || [],
@@ -858,6 +845,81 @@
 
   // Filters are separate React Flow nodes: the webhook and every branch can
   // have one. Do not associate a chip with the nearest module by guesswork.
+  function parseFilterConditionText(text) {
+    const source = normalizeText(text, 6000);
+    const pattern = /Условие\s+(\d+)\s+Если\s+Значение\s+(.+?)\s+Условие\s+(.+?)\s+Значение(?:\s+(?!Преобразовать(?:\s|$))(.+?))?(?=\s+Преобразовать|\s+Добавить условие|\s+Отменить|$)/gi;
+    return [...source.matchAll(pattern)].slice(0, 30).map(match => ({
+      number: Number(match[1]),
+      left: redact(match[2], 'filter left operand', 700),
+      operator: redact(match[3], 'filter operator', 240),
+      right: redact(match[4] || '', 'filter right operand', 700),
+      source: 'dialog DOM text'
+    }));
+  }
+
+  async function inspectFilterFields() {
+    const panel = Array.from(document.querySelectorAll('.al-modal__content, [role="dialog"], [aria-modal="true"]'))
+      .filter(isVisible)
+      .find(element => /Фильтр входящих данных|Настройте ветвление|Задать поведение связки по условию/i.test(element.innerText || ''));
+    if (!panel) return { status: 'not_confirmed', reason: 'Панель фильтра не найдена.' };
+    const text = redact(panel.innerText || panel.textContent || '', 'filter panel', 6000);
+    const conditions = parseFilterConditionText(text);
+    const labels = [];
+    const candidates = Array.from(panel.querySelectorAll('*'))
+      .filter(isVisible).filter(element => {
+        const name = normalizeText(element.textContent, 400);
+        if (!name || name.length < 5 || element.querySelectorAll('*').length > 3) return false;
+        const style = getComputedStyle(element);
+        return element.hasAttribute('title') || element.hasAttribute('aria-label') ||
+          style.textOverflow === 'ellipsis' || element.scrollWidth > element.clientWidth + 2;
+      }).slice(0, 30);
+    for (const element of candidates) {
+      const visible = redact(element.innerText || element.textContent || '', 'filter selected label', 500);
+      const attribute = redact(element.getAttribute('title') || element.getAttribute('aria-label') || '', 'filter selected label', 700);
+      const before = new Set(Array.from(document.querySelectorAll('[role="tooltip"], .al-tooltip__inner'))
+        .filter(isVisible).map(item => normalizeText(item.innerText || item.textContent, 700)));
+      element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
+      element.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false, cancelable: true, view: window }));
+      await delay(220);
+      const revealed = Array.from(document.querySelectorAll('[role="tooltip"], .al-tooltip__inner'))
+        .filter(isVisible).map(item => normalizeText(item.innerText || item.textContent, 700))
+        .filter(value => value && !before.has(value) && value !== visible);
+      element.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, cancelable: true, view: window }));
+      element.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false, cancelable: true, view: window }));
+      if (attribute || revealed.length || /…|\.\.\.$/.test(visible) || element.scrollWidth > element.clientWidth + 2) {
+        labels.push({ visible, full: redact(attribute || revealed[0] || element.textContent || '', 'filter selected label', 700),
+          source: attribute ? 'attribute' : (revealed.length ? 'hover tooltip' : 'DOM text'),
+          truncated_on_screen: element.scrollWidth > element.clientWidth + 2 || /…|\.\.\.$/.test(visible) });
+      }
+    }
+    let unresolved = false;
+    for (const condition of conditions) {
+      for (const key of ['left', 'right']) {
+        const operand = condition[key];
+        if (!/(?:…|\.\.\.)$/.test(operand)) continue;
+        const prefix = operand.replace(/(?:…|\.\.\.)$/, '').trim();
+        const match = labels.find(label => label.visible === operand && label.full.startsWith(prefix) &&
+          label.full.length > operand.length && !/(?:…|\.\.\.)$/.test(label.full));
+        if (match) {
+          condition[key] = match.full;
+          condition.source = `dialog DOM text + ${match.source}`;
+        } else {
+          unresolved = true;
+          condition.status = 'truncated_operand_not_confirmed';
+        }
+      }
+      if (!condition.left || !condition.operator ||
+          (!condition.right && !/^(?:(?:непустое|пустое|is empty|is not empty|exists)(?:\s|$))/i.test(condition.operator))) {
+        unresolved = true;
+        condition.status = 'missing_operand_not_confirmed';
+      }
+    }
+    return { status: unresolved ? 'not_confirmed' : (conditions.length ? 'conditions_read' :
+      (/Условие\s+\d+/i.test(text) ? 'not_confirmed' : 'no_conditions_visible')),
+      conditions, selected_labels: labels.slice(0, 24),
+      limits: 'Значения из DOM/tooltip — наблюдение, не доказательство сохранения. Неоднозначные поля остаются непроверенными.' };
+  }
+
   function constructorFilterTargets() {
     const chips = Array.from(document.querySelectorAll('[class*="bgConditionNode"]'))
       .filter(isVisible)
@@ -935,6 +997,7 @@
       const dialogs = snapshot.evidence?.dialogs || [];
       const confirmed = changed && dialogs.some(dialog => /фильтр|услови|поведени/i.test(dialog.text || ''));
       if (confirmed) records.push({ filter: plan, opened: true,
+        filter_fields: await inspectFilterFields(),
         controls: snapshot.evidence?.controls || [], dialogs,
         visible_text: snapshot.evidence?.visible_text || '' });
       else skipped.push({ filter: plan, reason: 'Настройки фильтра не подтверждены после открытия.' });
@@ -1178,7 +1241,7 @@
       snapshot.module_opened = detection.opened;
       snapshot.module_settings_opened = detection.module_settings_opened;
       snapshot.module_detection = detection;
-      if (plannedStep.number === 1) snapshot.sub_settings = await scanModuleOneAreas(element, plannedStep, false);
+      if (plannedStep.number === 1) snapshot.sub_settings = await scanModuleOneAreas(element, plannedStep, true);
       if (!detection.module_settings_opened) {
         skipped.push({ step: plannedStep, reason: detection.reason });
       }
@@ -1239,6 +1302,10 @@
         filters_found: filters.planned,
         filters_read: filters.records.length,
         filters_unconfirmed: filters.skipped.length,
+        filters_with_conditions: filters.records.filter(record => record.filter_fields?.status === 'conditions_read').length,
+        filters_without_visible_conditions: filters.records.filter(record => record.filter_fields?.status === 'no_conditions_visible').length,
+        incoming_filter_status: modules.flatMap(module => module.sub_settings?.records || [])
+          .find(record => record.kind === 'filter')?.filter_fields?.status || 'not_confirmed',
         branch_filters_found: filters.records.filter(record => record.filter.kind === 'branch').length + filters.skipped.filter(item => item.filter.kind === 'branch').length,
         branch_filters_read: filters.records.filter(record => record.filter.kind === 'branch').length,
         error_handler_panels_opened: modules.filter(module => module.error_handler?.panel_opened).length,

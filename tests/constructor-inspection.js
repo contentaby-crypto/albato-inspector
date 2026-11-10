@@ -80,7 +80,52 @@ document.body.appendChild(customPanel);
 const diagnostic = load('errorHandlerChoiceDiagnostics', 'async function scanModuleErrorHandler')();
 assert.equal(diagnostic.length, 3);
 assert(diagnostic[0].ancestors.some(ancestor => ancestor.class_name.includes('choice-active')));
-checkSafeMenuTraversal().then(() => console.log('constructor filter and error-handler fixture checks passed')).catch(error => {
+async function checkFilterFieldCapture() {
+  const parse = load('parseFilterConditionText', 'async function inspectFilterFields');
+  const raw = 'Фильтр входящих данных Условие 1 Если Значение 1. Авито: Новое сообщение: Идентификатор диалога Условие Равно Значение 123 Преобразовать Добавить условие';
+  const conditions = parse(raw);
+  assert.equal(conditions.length, 1);
+  assert.equal(conditions[0].left, '1. Авито: Новое сообщение: Идентификатор диалога');
+  assert.equal(conditions[0].operator, 'Равно');
+  assert.equal(conditions[0].right, '123');
+  const unary = parse('Настройте ветвление Условие 1 Если Значение 4. Data Storage: macroRequestId Условие Непустое (с данными) Значение Преобразовать в группу условий Добавить условие Отменить');
+  assert.equal(unary.length, 1);
+  assert.equal(unary[0].operator, 'Непустое (с данными)');
+  assert.equal(unary[0].right, '');
+  const node = document.createElement('div');
+  node.className = 'react-flow__node';
+  node.innerHTML = '<button>1. Авито: Новое сообщение</button><div class="al-step-card-wrapper-pro-mode__toolbar"><div class="cursor-pointer">Фильтр вкл.</div></div>';
+  document.body.appendChild(node);
+  const target = load('findModuleRelatedTarget', 'function collectRelatedAreaDiagnostics')(node.querySelector('button'), 'filter');
+  assert.equal(target.textContent, 'Фильтр вкл.');
+  target.remove();
+  assert.equal(load('findModuleRelatedTarget', 'function collectRelatedAreaDiagnostics')(node.querySelector('button'), 'filter'), null,
+    'must not click a neighboring branch filter');
+  const panel = document.createElement('div');
+  panel.className = 'al-modal__content';
+  panel.innerHTML = '<h2>Фильтр входящих данных</h2><div>Условие 1 Если Значение <span class="truncate" style="text-overflow:ellipsis">1. Авито: Новое сообщение: Идентификатор диалога</span> Условие Равно Значение 123 Преобразовать Добавить условие</div>';
+  document.body.appendChild(panel);
+  const label = panel.querySelector('span');
+  Object.defineProperty(label, 'scrollWidth', { value: 180 });
+  Object.defineProperty(label, 'clientWidth', { value: 90 });
+  label.addEventListener('mouseover', () => {
+    const tooltip = document.createElement('div');
+    tooltip.setAttribute('role', 'tooltip');
+    tooltip.textContent = '1. Авито: Новое сообщение: Идентификатор диалога (полное)';
+    document.body.appendChild(tooltip);
+  });
+  const start = source.indexOf('  async function inspectFilterFields(');
+  const end = source.indexOf('  function constructorFilterTargets(', start);
+  const inspect = new Function('document', 'window', 'MouseEvent', 'getComputedStyle', 'isVisible', 'normalizeText', 'redact', 'delay', 'parseFilterConditionText',
+    `${source.slice(start, end)}\nreturn inspectFilterFields;`)(document, dom.window, dom.window.MouseEvent, dom.window.getComputedStyle,
+    isVisible, normalizeText, redact, async () => {}, parse);
+  const result = await inspect();
+  assert.equal(result.status, 'conditions_read');
+  assert.equal(result.conditions[0].left, '1. Авито: Новое сообщение: Идентификатор диалога');
+  assert.equal(result.selected_labels[0].source, 'hover tooltip');
+  assert.equal(result.selected_labels[0].full, '1. Авито: Новое сообщение: Идентификатор диалога (полное)');
+}
+checkSafeMenuTraversal().then(checkFilterFieldCapture).then(() => console.log('constructor filter and error-handler fixture checks passed')).catch(error => {
   console.error(error);
   process.exitCode = 1;
 });
